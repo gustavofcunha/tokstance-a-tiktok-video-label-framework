@@ -17,7 +17,6 @@ def render_tiktok(url):
     <blockquote class="tiktok-embed" cite="{url}" data-video-id="{video_id}" style="max-width: 605px;min-width: 325px;">
       <section></section>
     </blockquote>
-    <script async src="https://www.tiktok.com/embed.js"></script>
     """
     return html
 
@@ -60,7 +59,7 @@ def salvar_e_proximo(nome, index, stance):
     return next_idx, html, target, None, "✅ Salvo com sucesso!", ARQUIVO_RESULTADOS
 
 # Constrói a Interface
-with gr.Blocks(theme=gr.themes.Soft()) as demo:
+with gr.Blocks() as demo:
     gr.Markdown("# 📊 Rotulação de Posição (Stance) - TikTok")
     
     with gr.Group(visible=True) as tela_login:
@@ -101,4 +100,9 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
         outputs=[index_state, video_html, target_lbl, stance_radio, status_msg, btn_download]
     )
 
-demo.launch()
+demo.launch(
+    theme=gr.themes.Soft(),
+    head='<script async src="https://www.tiktok.com/embed.js"></script>',
+    server_name="0.0.0.0",
+    server_port=7860,
+)
