@@ -1,3 +1,15 @@
+---
+title: Multimodal Stance Annotation Framework
+emoji: 📊
+colorFrom: gray
+colorTo: blue
+sdk: gradio
+sdk_version: "6.26.0"
+python_version: "3.12"
+app_file: app.py
+pinned: false
+---
+
 # Multimodal Stance Annotation Framework
 
 An online data-labeling framework for multiple annotators to label the stance expressed in TikTok videos. The project is designed for a multimodal stance-detection task: annotators watch each video and classify its position in relation to a target claim or topic.
