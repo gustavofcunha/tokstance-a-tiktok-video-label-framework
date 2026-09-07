@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+
+# Local environments
+.venv/
+venv/
+.pytest_cache/
+
+# Research input and runtime data
+videos.csv
+configuracao.json
+atribuicoes.csv
+resultados_anotacao.csv
+acessos_log.csv
+erros_videos.csv
+concordancia.json
+
+# Local logs and generated exports
+*.log
