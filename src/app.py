@@ -21,6 +21,7 @@ import pandas as pd
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 BASE_DIR = Path(os.getenv("TOKSTANCE_DATA_DIR") or PROJECT_DIR / "data")
 VIDEOS_FILE = BASE_DIR / "videos.csv"
+RESERVE_VIDEOS_FILE = BASE_DIR / "videos_reserva.csv"
 RESULTS_FILE = BASE_DIR / "resultados_anotacao.csv"
 ASSIGNMENTS_FILE = BASE_DIR / "atribuicoes.csv"
 CONFIG_FILE = BASE_DIR / "configuracao.json"
@@ -39,9 +40,6 @@ STANCE_OPTIONS = [
 ]
 BRT_TZ = timezone(timedelta(hours=-3))
 
-if not VIDEOS_FILE.exists():
-    raise FileNotFoundError(f"\n[ERRO CRÍTICO] Arquivo '{VIDEOS_FILE.name}' ausente. A execução foi abortada.")
-
 # ==============================================================================
 # FUNÇÕES DE RETAGUARDA (DADOS E LÓGICA)
 # ==============================================================================
@@ -50,6 +48,8 @@ def clean_users(value):
     return list(dict.fromkeys(user.strip() for user in users if user.strip()))
 
 def load_videos():
+    if not VIDEOS_FILE.exists():
+        raise FileNotFoundError(f"\n[ERRO CRÍTICO] Arquivo '{VIDEOS_FILE.name}' ausente. A execução foi abortada.")
     videos = pd.read_csv(VIDEOS_FILE, dtype={
         "id": str,
         "url": str,
@@ -58,10 +58,36 @@ def load_videos():
         "voice_to_text": str,
         "video_duration": str,
     })
+    if videos.empty:
+        raise ValueError("videos.csv precisa conter ao menos um registro de vídeo.")
     missing = {"id", "url", "target"}.difference(videos.columns)
     if missing:
         raise ValueError(f"videos.csv não possui as colunas obrigatórias: {', '.join(sorted(missing))}")
     return videos.fillna("")
+
+def load_reserve_videos():
+    if not RESERVE_VIDEOS_FILE.exists():
+        raise FileNotFoundError(f"\n[ERRO CRÍTICO] Arquivo '{RESERVE_VIDEOS_FILE.name}' ausente. A execução foi abortada.")
+    if RESERVE_VIDEOS_FILE.stat().st_size == 0:
+        raise ValueError("videos_reserva.csv precisa conter ao menos um registro de vídeo.")
+    reserve_videos = pd.read_csv(RESERVE_VIDEOS_FILE, dtype=str).fillna("")
+    if reserve_videos.empty:
+        raise ValueError("videos_reserva.csv precisa conter ao menos um registro de vídeo.")
+    missing = {"id", "url", "target"}.difference(reserve_videos.columns)
+    if missing:
+        raise ValueError(f"videos_reserva.csv não possui as colunas obrigatórias: {', '.join(sorted(missing))}")
+    for column in ("video_description", "voice_to_text", "video_duration"):
+        if column not in reserve_videos.columns:
+            reserve_videos[column] = ""
+    return reserve_videos
+
+
+def validate_required_input_files():
+    load_videos()
+    load_reserve_videos()
+
+
+validate_required_input_files()
 
 def save_config(config):
     with CONFIG_FILE.open("w", encoding="utf-8") as config_file:
@@ -170,7 +196,10 @@ def read_results():
 
 
 def read_error_assignments():
-    columns = ["timestamp", "video_id", "url", "labeler", "assignment_id"]
+    columns = [
+        "timestamp", "video_id", "url", "labeler", "assignment_id",
+        "replacement_video_id", "replacement_url", "replacement_assignment_id", "replacement_status",
+    ]
     if not ERRORS_FILE.exists() or ERRORS_FILE.stat().st_size == 0:
         return pd.DataFrame(columns=columns)
     with ERRORS_FILE.open(encoding="utf-8", newline="") as error_file:
@@ -178,21 +207,33 @@ def read_error_assignments():
     if not rows:
         return pd.DataFrame(columns=columns)
     if rows[0][:4] == columns[:4]:
-        rows = rows[1:]
+        columns_in_file = rows.pop(0)
+    else:
+        columns_in_file = columns[:5]
     normalized = []
     for row in rows:
         if len(row) < 4:
             continue
         timestamp, video_id, url, labeler = row[:4]
         assignment_id = row[4].strip() if len(row) >= 5 and row[4].strip() else f"legacy:{labeler}:{video_id}"
-        normalized.append({
-            "timestamp": timestamp,
-            "video_id": video_id,
-            "url": url,
-            "labeler": labeler,
-            "assignment_id": assignment_id,
-        })
-    return pd.DataFrame(normalized, columns=columns).drop_duplicates(subset=["assignment_id"], keep="last")
+        values = dict(zip(columns_in_file, row))
+        values["assignment_id"] = assignment_id
+        normalized.append({column: values.get(column, "") for column in columns})
+    return pd.DataFrame(normalized, columns=columns)
+
+
+def persist_frame_if_changed(frame, file_path, columns):
+    content = frame.reindex(columns=columns).to_csv(index=False)
+    if file_path.exists() and file_path.read_text(encoding="utf-8") == content:
+        return
+    file_path.write_text(content, encoding="utf-8")
+
+
+def ensure_errors_schema():
+    if not ERRORS_FILE.exists() or ERRORS_FILE.stat().st_size == 0:
+        return
+    errors = read_error_assignments()
+    persist_frame_if_changed(errors, ERRORS_FILE, list(errors.columns))
 
 
 def ensure_results_schema():
@@ -264,7 +305,7 @@ def render_video_card(item, highlight_target=False):
     </div>
     """
 
-def make_assignments(config, videos):
+def make_assignments(config, videos, persist=True):
     labelers = config.get("labelers", [])
     overlap_percent = max(0.0, min(100.0, float(config.get("overlap_percent", 0))))
     version = assignment_version(config, videos)
@@ -328,11 +369,204 @@ def make_assignments(config, videos):
         for labeler, video_index in assignments
     ], columns=assignment_columns)
     result = result.drop_duplicates(subset=["labeler", "video_id"], keep="last").reset_index(drop=True)
-    result.to_csv(ASSIGNMENTS_FILE, index=False)
+    if persist:
+        persist_frame_if_changed(result, ASSIGNMENTS_FILE, assignment_columns)
     return result
 
+def apply_reserve_replacements(assignments):
+    if assignments.empty or not ERRORS_FILE.exists():
+        return assignments
+
+    errors = read_error_assignments()
+    reserve_videos = load_reserve_videos().drop_duplicates(subset=["id"], keep="first")
+    if errors.empty:
+        return assignments
+    if reserve_videos.empty:
+        pending_errors = errors["replacement_assignment_id"].astype(str).str.strip().eq("")
+        errors.loc[pending_errors, "replacement_status"] = "SEM_RESERVA_DISPONIVEL"
+        persist_frame_if_changed(errors, ERRORS_FILE, list(errors.columns))
+        return assignments
+
+    reserve_ids = set(reserve_videos["id"].astype(str))
+    used_reserve_ids = set(assignments[assignments["video_id"].astype(str).isin(reserve_ids)]["video_id"].astype(str))
+    used_reserve_ids.update(errors[errors["video_id"].astype(str).isin(reserve_ids)]["video_id"].astype(str))
+    available_reserves = reserve_videos[~reserve_videos["id"].astype(str).isin(used_reserve_ids)]
+    results = read_results()
+    completed_assignment_ids = set(results.get("assignment_id", pd.Series(dtype=str)).astype(str).str.strip())
+    assignments_changed = False
+    errors_changed = False
+
+    for error_index, error in errors.iterrows():
+        if str(error.get("replacement_assignment_id", "")).strip():
+            continue
+        assignment_id = str(error.get("assignment_id", "")).strip()
+        original_video_id = str(error.get("video_id", "")).strip()
+        prior_replacement = errors[
+            errors["video_id"].astype(str).eq(original_video_id)
+            & errors["replacement_assignment_id"].astype(str).ne("")
+        ]
+        existing_reserve_id = ""
+        prior_status = ""
+        if not prior_replacement.empty:
+            original_video_id = str(prior_replacement.iloc[0]["video_id"]).strip()
+            existing_reserve_id = str(prior_replacement.iloc[0]["replacement_video_id"]).strip()
+            prior_status = str(prior_replacement.iloc[0]["replacement_status"]).strip()
+        matching_rows = assignments.index[assignments["assignment_id"].astype(str).eq(assignment_id)]
+        if matching_rows.empty:
+            matching_rows = assignments.index[
+                assignments["labeler"].astype(str).eq(str(error.get("labeler", "")))
+                & assignments["video_id"].astype(str).eq(str(error.get("video_id", "")))
+            ]
+        if matching_rows.empty and existing_reserve_id:
+            matching_rows = assignments.index[
+                assignments["labeler"].astype(str).eq(str(error.get("labeler", "")))
+                & assignments["video_id"].astype(str).eq(existing_reserve_id)
+            ]
+        if matching_rows.empty:
+            continue
+
+        source_index = matching_rows[0]
+        if prior_status == "SUBSTITUIDO_OVERLAP_REBALANCEADO":
+            errors.at[error_index, "replacement_video_id"] = existing_reserve_id
+            errors.at[error_index, "replacement_url"] = str(assignments.at[source_index, "url"])
+            errors.at[error_index, "replacement_assignment_id"] = str(assignments.at[source_index, "assignment_id"])
+            errors.at[error_index, "replacement_status"] = prior_status
+            errors_changed = True
+            continue
+
+        group_rows = assignments.index[assignments["video_id"].astype(str).eq(original_video_id)]
+        replacement_rows = errors[
+            errors["video_id"].astype(str).eq(original_video_id)
+            & errors["replacement_assignment_id"].astype(str).ne("")
+        ]["replacement_assignment_id"].astype(str).tolist()
+        if replacement_rows:
+            group_rows = group_rows.union(
+                assignments.index[assignments["assignment_id"].astype(str).isin(replacement_rows)]
+            )
+        if existing_reserve_id:
+            group_rows = group_rows.union(
+                assignments.index[assignments["video_id"].astype(str).eq(existing_reserve_id)]
+            )
+        group_rows = group_rows.sort_values()
+        group_has_completed = any(
+            str(assignments.at[index, "assignment_id"]).strip() in completed_assignment_ids
+            for index in group_rows
+        )
+        source_target = str(assignments.at[source_index, "target"]).strip()
+        if group_rows.empty:
+            group_rows = matching_rows
+        compatible_reserves = reserve_videos[
+            reserve_videos["target"].astype(str).str.strip().eq(source_target)
+        ]
+        if existing_reserve_id:
+            compatible_reserves = compatible_reserves[
+                compatible_reserves["id"].astype(str).eq(existing_reserve_id)
+            ]
+        else:
+            compatible_reserves = compatible_reserves[
+                compatible_reserves["id"].astype(str).isin(available_reserves["id"].astype(str))
+            ]
+        if group_has_completed and not existing_reserve_id:
+            video_counts = assignments.groupby(assignments["video_id"].astype(str))["assignment_id"].transform("size")
+            candidate_rows = assignments.index[
+                video_counts.eq(1)
+                & assignments["video_id"].astype(str).ne(original_video_id)
+                & assignments["video_id"].astype(str).isin(
+                    assignments.loc[assignments["assignment_id"].astype(str).isin(completed_assignment_ids), "video_id"].astype(str)
+                )
+                & assignments["target"].astype(str).str.strip().eq(source_target)
+                & assignments["labeler"].astype(str).ne(str(error.get("labeler", "")))
+            ]
+            if not candidate_rows.empty:
+                candidate_index = candidate_rows[0]
+                candidate_video_id = str(assignments.at[candidate_index, "video_id"])
+                candidate = assignments.loc[candidate_index].copy()
+                source_labeler = str(assignments.at[source_index, "labeler"])
+                source_version = str(assignments.at[source_index, "assignment_version"])
+                source_replacement_id = assignment_identifier(source_version, source_labeler, candidate_video_id)
+                rows_to_promote = [
+                    index for index in group_rows
+                    if str(assignments.at[index, "assignment_id"]).strip() not in completed_assignment_ids
+                ]
+                if source_index not in rows_to_promote:
+                    rows_to_promote.append(source_index)
+                for promotion_index in rows_to_promote:
+                    promotion_labeler = str(assignments.at[promotion_index, "labeler"])
+                    promotion_version = str(assignments.at[promotion_index, "assignment_version"])
+                    assignments.at[promotion_index, "video_id"] = candidate_video_id
+                    for column in ("url", "target", "video_description", "voice_to_text", "video_duration"):
+                        assignments.at[promotion_index, column] = candidate[column]
+                    assignments.at[promotion_index, "assignment_id"] = assignment_identifier(
+                        promotion_version, promotion_labeler, candidate_video_id
+                    )
+                errors.at[error_index, "replacement_video_id"] = candidate_video_id
+                errors.at[error_index, "replacement_url"] = str(candidate["url"])
+                errors.at[error_index, "replacement_assignment_id"] = source_replacement_id
+                errors.at[error_index, "replacement_status"] = "SUBSTITUIDO_OVERLAP_REBALANCEADO"
+                assignments_changed = True
+                errors_changed = True
+                continue
+        if compatible_reserves.empty:
+            if group_has_completed:
+                errors.at[error_index, "replacement_status"] = "CRITICO_OVERLAP_INCONSISTENTE"
+            else:
+                errors.at[error_index, "replacement_status"] = (
+                    "SEM_RESERVA_DISPONIVEL" if available_reserves.empty else "SEM_RESERVA_COMPATIVEL"
+                )
+            errors_changed = True
+            continue
+
+        reserve = compatible_reserves.iloc[0]
+        reserve_id = str(reserve["id"])
+        rows_to_replace = matching_rows if group_has_completed else group_rows
+        replacement_assignment_id = ""
+        for replacement_index in rows_to_replace:
+            labeler = str(assignments.at[replacement_index, "labeler"])
+            version = str(assignments.at[replacement_index, "assignment_version"])
+            replacement_assignment_id = assignment_identifier(version, labeler, reserve_id)
+            if str(assignments.at[replacement_index, "assignment_id"]).strip() in completed_assignment_ids:
+                continue
+            assignments.at[replacement_index, "video_id"] = reserve_id
+            for column in ("url", "target", "video_description", "voice_to_text", "video_duration"):
+                assignments.at[replacement_index, column] = reserve.get(column, "")
+            assignments.at[replacement_index, "assignment_id"] = replacement_assignment_id
+            assignments_changed = True
+        labeler = str(assignments.at[source_index, "labeler"])
+        version = str(assignments.at[source_index, "assignment_version"])
+        replacement_assignment_id = assignment_identifier(version, labeler, reserve_id)
+        errors.at[error_index, "replacement_video_id"] = reserve_id
+        errors.at[error_index, "replacement_url"] = str(reserve["url"])
+        errors.at[error_index, "replacement_assignment_id"] = replacement_assignment_id
+        errors.at[error_index, "replacement_status"] = (
+            "CRITICO_OVERLAP_INCONSISTENTE" if group_has_completed else "SUBSTITUIDO_OVERLAP"
+        )
+        if not group_has_completed and not existing_reserve_id:
+            available_reserves = available_reserves[available_reserves["id"].astype(str).ne(reserve_id)]
+        errors_changed = True
+
+    if assignments_changed:
+        persist_frame_if_changed(assignments, ASSIGNMENTS_FILE, list(assignments.columns))
+    if errors_changed:
+        persist_frame_if_changed(errors, ERRORS_FILE, list(errors.columns))
+    return assignments
+
 def load_assignments(config, videos):
-    return make_assignments(config, videos)
+    base_assignments = make_assignments(config, videos, persist=False)
+    assignments = base_assignments
+    if ASSIGNMENTS_FILE.exists() and not base_assignments.empty:
+        try:
+            persisted = pd.read_csv(ASSIGNMENTS_FILE, dtype=str).fillna("")
+            has_schema = set(base_assignments.columns).issubset(persisted.columns)
+            same_version = set(persisted.get("assignment_version", [])) == {base_assignments.iloc[0]["assignment_version"]}
+            if has_schema and same_version and len(persisted) == len(base_assignments):
+                assignments = persisted[base_assignments.columns].copy()
+        except (pd.errors.EmptyDataError, pd.errors.ParserError):
+            pass
+    if not assignments.empty and not assignments.equals(base_assignments):
+        persist_frame_if_changed(assignments, ASSIGNMENTS_FILE, list(base_assignments.columns))
+    elif not ASSIGNMENTS_FILE.exists():
+        persist_frame_if_changed(base_assignments, ASSIGNMENTS_FILE, list(base_assignments.columns))
+    return apply_reserve_replacements(assignments)
 
 
 LABEL_DISTANCE = {
@@ -519,6 +753,85 @@ def annotation_daily_chart(results):
     return f"<div class='chart-legend'>{legend}</div>{''.join(days)}"
 
 
+def admin_insights_html(assignments, results, errors, videos, agreement, fast_annotations):
+    completed_ids = set(results.get("assignment_id", pd.Series(dtype=str)).astype(str).str.strip())
+    completed_ids.update(errors.get("assignment_id", pd.Series(dtype=str)).astype(str).str.strip())
+    assigned = len(assignments)
+    completed = sum(assignments["assignment_id"].astype(str).isin(completed_ids)) if assigned else 0
+    pending = assigned - completed
+    completion_percent = completed / assigned if assigned else 0
+    reserve_videos = load_reserve_videos()
+    used_reserve_ids = set(errors.get("replacement_video_id", pd.Series(dtype=str)).astype(str).str.strip()) - {""}
+    remaining_reserves = max(len(reserve_videos) - len(used_reserve_ids), 0)
+    analysis_times = pd.to_numeric(results.get("tempo_analise_segundos", pd.Series(dtype=str)), errors="coerce").dropna()
+    median_analysis = analysis_times.median() if not analysis_times.empty else None
+    error_count = len(errors)
+    replacement_count = len(used_reserve_ids)
+    critical_overlap_count = int(errors.get("replacement_status", pd.Series(dtype=str)).astype(str).str.startswith("CRITICO_").sum())
+
+    kpis = [
+        ("Cobertura da rodada", f"{completion_percent:.0%}", f"{completed} concluídos de {assigned}"),
+        ("Pendências", str(pending), "atribuições ainda abertas"),
+        ("Erros reportados", str(error_count), f"{replacement_count} substituídos por reserva"),
+        ("Reservas disponíveis", str(remaining_reserves), f"{len(reserve_videos)} no pool total"),
+        ("Tempo mediano", f"{median_analysis:.1f}s" if median_analysis is not None else "n/d", "por anotação registrada"),
+        ("Discordâncias", str(len(agreement["videos_com_discordancia"])), "vídeos com posições diferentes"),
+    ]
+    kpi_html = "".join(
+        f"<div class='admin-kpi'><span>{escape(label)}</span><strong>{escape(value)}</strong><small>{escape(note)}</small></div>"
+        for label, value, note in kpis
+    )
+
+    labeler_rows = []
+    if not assignments.empty:
+        for labeler, labeler_assignments in assignments.groupby("labeler", sort=False):
+            labeler_assigned = len(labeler_assignments)
+            labeler_completed = int(labeler_assignments["assignment_id"].astype(str).isin(completed_ids).sum())
+            labeler_rows.append((str(labeler), labeler_completed / labeler_assigned if labeler_assigned else 0, labeler_completed, labeler_assigned))
+    labeler_rows.sort(key=lambda item: (item[1], item[0]))
+    labeler_chart = "".join(
+        f"<div class='insight-bar-row'><span>{escape(labeler)}</span><div class='insight-bar-track'><div class='insight-bar-fill' style='width:{percent:.0%}'></div></div><strong>{done}/{total}</strong></div>"
+        for labeler, percent, done, total in labeler_rows
+    ) or "<p class='muted'>Ainda não há atribuições para comparar.</p>"
+
+    stance_counts = results[results["stance"].isin(STANCE_OPTIONS)]["stance"].value_counts() if "stance" in results else pd.Series(dtype=int)
+    stance_max = max(int(stance_counts.max()), 1) if not stance_counts.empty else 1
+    stance_colors = {"Contra": "#9c0014", "A Favor": "#176b87", "Neutro": "#b56b00", "Vídeo não relacionado ao target": "#626b73"}
+    stance_chart = "".join(
+        f"<div class='insight-bar-row'><span>{escape(label)}</span><div class='insight-bar-track'><div class='insight-bar-fill' style='width:{int(stance_counts.get(label, 0)) / stance_max:.0%}; background:{stance_colors[label]}'></div></div><strong>{int(stance_counts.get(label, 0))}</strong></div>"
+        for label in STANCE_OPTIONS
+    )
+
+    signals = []
+    if critical_overlap_count:
+        signals.append(("Alerta crítico de overlap", f"{critical_overlap_count} atribuição(ões) não puderam preservar o overlap porque já havia anotação no vídeo original. Revise a rodada antes de continuar.", "critical"))
+    if remaining_reserves <= max(1, len(reserve_videos) // 5):
+        signals.append(("Atenção", "O estoque de reservas está baixo. Reponha o pool antes que novas falhas parem a rodada.", "warning"))
+    if fast_annotations:
+        signals.append(("Revisar qualidade", f"{len(fast_annotations)} análise(s) ficaram mais de 5 segundos abaixo da duração do vídeo.", "warning"))
+    if agreement["videos_com_discordancia"]:
+        signals.append(("Revisar concordância", f"{len(agreement['videos_com_discordancia'])} vídeo(s) têm discordância entre anotadores; priorize os maiores escores.", "info"))
+    if pending and assigned and completion_percent < 0.25:
+        signals.append(("Ritmo da rodada", "Menos de 25% da rodada foi concluída. Confirme se todos os anotadores conseguiram iniciar a sessão.", "info"))
+    if not signals:
+        signals.append(("Operação estável", "Nenhum sinal preventivo relevante foi detectado nesta rodada.", "ok"))
+    signals_html = "".join(
+        f"<div class='insight-signal {kind}'><strong>{escape(title)}</strong><span>{escape(message)}</span></div>"
+        for title, message, kind in signals
+    )
+    return f"""
+    <section class='admin-command-center'>
+        <div class='admin-section-heading'><div><span class='section-eyebrow'>Painel de controle</span><h3>Leitura operacional da rodada</h3></div><span class='admin-live-dot'>dados locais</span></div>
+        <div class='admin-kpi-grid'>{kpi_html}</div>
+        <div class='admin-insight-grid'>
+            <section class='admin-chart'><h4>Conclusão por rotulador</h4><p class='metric-note'>Carga concluída comparada ao total atribuído.</p>{labeler_chart}</section>
+            <section class='admin-chart'><h4>Distribuição das posições</h4><p class='metric-note'>Ajuda a detectar concentração ou classes sem cobertura.</p>{stance_chart}</section>
+            <section class='admin-signals'><h4>Sinais para ação</h4>{signals_html}</section>
+        </div>
+    </section>
+    """
+
+
 def agreement_summary(results, selected_version=None):
     config = load_config()
     videos = load_videos()
@@ -579,8 +892,11 @@ def agreement_summary(results, selected_version=None):
             <table><thead><tr><th>Vídeo</th><th>Rotulador</th><th>Duração</th><th>Análise</th><th>Diferença</th></tr></thead><tbody>{fast_rows}</tbody></table>
         </section>
         """
+    insights_assignments = selected_assignments if not selected_assignments.empty else assignment_table_for_version(assignments, version_results, version_errors, version)
+    admin_insights = admin_insights_html(insights_assignments, version_results, version_errors, videos, agreement, fast_annotations)
     return f"""
     <section class='agreement-dashboard'>
+        {admin_insights}
         <section class='assignment-progress'>
             <div class='section-heading'><div><span class='section-eyebrow'>Rodada ativa</span><h3>Progresso dos rotuladores</h3></div><span class='version-label'>{escape(assignment_version)}</span></div>
             {assignment_progress}
@@ -791,21 +1107,40 @@ def process_annotation(username, queue, position, stance, login_time, start_time
     item = queue[position]
     tempo_analise = agora - start_time
 
+    retry_replacement = False
     if stance == "ERRO_MANUAL_TIMEOUT":
         if tempo_analise < 10:
             new_pos, video_html, controls_visible, pergunta, progress = video_outputs(queue, position, username_clean)
             aviso = f"⏳ Aguarde 10s para selecionar esta opção. O vídeo ainda pode carregar. (Faltam {int(10 - tempo_analise)}s)"
             return position, start_time, video_html, controls_visible, pergunta, progress, aviso, gr.update()
         else:
+            source_error = read_error_assignments()
+            source_error = source_error[
+                source_error["replacement_video_id"].astype(str).eq(str(item["video_id"]))
+                & source_error["replacement_assignment_id"].astype(str).ne("")
+            ]
+            source_item = source_error.iloc[0] if not source_error.empty else None
             error_row = {
                 "timestamp": datetime.now(BRT_TZ).isoformat(),
-                "video_id": item["video_id"],
-                "url": item["url"],
+                "video_id": source_item["video_id"] if source_item is not None else item["video_id"],
+                "url": source_item["url"] if source_item is not None else item["url"],
                 "labeler": username_clean,
                 "assignment_id": item.get("assignment_id", f"legacy:{username_clean}:{item['video_id']}")
             }
             with FILE_LOCK:
-                append_csv_row(ERRORS_FILE, error_row, ["timestamp", "video_id", "url", "labeler", "assignment_id"])
+                ensure_errors_schema()
+                append_csv_row(
+                    ERRORS_FILE,
+                    error_row,
+                    [
+                        "timestamp", "video_id", "url", "labeler", "assignment_id",
+                        "replacement_video_id", "replacement_url", "replacement_assignment_id", "replacement_status",
+                    ],
+                )
+            updated_queue = user_queue(username_clean, load_config(), load_videos())
+            if position < len(updated_queue) and updated_queue[position]["video_id"] != item["video_id"]:
+                queue[:] = updated_queue
+                retry_replacement = True
     else:
         row = {
             "timestamp": datetime.now(BRT_TZ).isoformat(),
@@ -827,7 +1162,7 @@ def process_annotation(username, queue, position, stance, login_time, start_time
     registrar_log(username_clean, "SALVOU_ANOTACAO", agora - login_time)
     agreement_summary(read_results())
 
-    next_position = position + 1
+    next_position = position if retry_replacement else position + 1
     new_position, video_html, controls_visible, pergunta, progress = video_outputs(queue, next_position, username_clean)
 
     return new_position, agora, video_html, controls_visible, pergunta, progress, "", gr.update(value=None)
@@ -929,6 +1264,30 @@ APP_CSS = """
     .duration-alert table { width: 100%; border-collapse: collapse; background: #fff9e6 !important; }
     .duration-alert th, .duration-alert td { padding: 10px 12px; border-bottom: 1px solid #eadcae; text-align: left; background: #fff9e6 !important; color: #4a3a00 !important; font-size: 16px; }
     .duration-alert th { font-weight: 700; }
+    .admin-command-center { margin: 0 0 22px; padding: 22px; border: 1px solid #d8dde3; border-top: 5px solid #176b87; background: #f7fafb; }
+    .admin-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+    .admin-section-heading h3 { margin: 3px 0 0; color: #1f2933; font-size: 23px; }
+    .admin-live-dot { padding: 6px 10px; border: 1px solid #b8d8df; color: #176b87; background: #eef8fa; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; }
+    .admin-kpi-grid { display: grid; grid-template-columns: repeat(6, minmax(130px, 1fr)); gap: 10px; }
+    .admin-kpi { min-height: 98px; padding: 13px 14px; border: 1px solid #dfe5e8; background: #ffffff; }
+    .admin-kpi span, .admin-kpi small { display: block; color: #66737c; }
+    .admin-kpi span { min-height: 30px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
+    .admin-kpi strong { display: block; margin: 4px 0 2px; color: #176b87; font-size: 27px; line-height: 1; }
+    .admin-kpi small { font-size: 11px; line-height: 1.3; }
+    .admin-insight-grid { display: grid; grid-template-columns: 1fr 1fr 1.25fr; gap: 12px; margin-top: 14px; }
+    .admin-chart, .admin-signals { min-width: 0; padding: 16px; border: 1px solid #dfe5e8; background: #ffffff; }
+    .admin-chart h4, .admin-signals h4 { margin: 0; color: #1f2933; font-size: 16px; }
+    .insight-bar-row { display: grid; grid-template-columns: minmax(92px, .8fr) minmax(0, 1.5fr) 42px; align-items: center; gap: 8px; margin: 13px 0; font-size: 12px; }
+    .insight-bar-track { height: 11px; overflow: hidden; background: #e8eef0; }
+    .insight-bar-fill { height: 100%; min-width: 2px; background: #176b87; transition: width .35s ease; }
+    .insight-signal { display: grid; gap: 4px; margin-top: 10px; padding: 10px 11px; border-left: 4px solid #176b87; background: #f2f8fa; color: #33434d; font-size: 12px; line-height: 1.4; }
+    .insight-signal strong { color: #176b87; font-size: 12px; }
+    .insight-signal.warning { border-left-color: #b56b00; background: #fff8eb; }
+    .insight-signal.warning strong { color: #8a5700; }
+    .insight-signal.critical { border-left-color: #9c0014; background: #fff0f2; }
+    .insight-signal.critical strong { color: #9c0014; }
+    .insight-signal.ok { border-left-color: #4f6f52; background: #f2f8f2; }
+    .insight-signal.ok strong { color: #4f6f52; }
 
     .assignment-table, .assignment-table *,
     .assignment-table .table-wrap, .assignment-table .dataframe,
@@ -982,6 +1341,8 @@ APP_CSS = """
     @media (max-width: 850px) {
         .shell { width: calc(100vw - 24px) !important; padding: 22px 16px !important; margin: 12px auto !important; }
         .agreement-kpis, .dashboard-grid, .analytics-grid { grid-template-columns: 1fr; }
+        .admin-kpi-grid, .admin-insight-grid { grid-template-columns: 1fr; }
+        .admin-section-heading { align-items: flex-start; flex-direction: column; }
         .labeler-layout { flex-direction: column !important; }
         .video-content-grid { grid-template-columns: 1fr; }
         .video-card iframe { width: 100% !important; max-width: 650px !important; }
@@ -1002,7 +1363,10 @@ APP_CSS = """
     .admin-panel h2, .admin-panel h3 { font-size: 20px !important; }
     .admin-header { align-items: center !important; justify-content: space-between !important; margin: 0 0 8px !important; min-height: 36px !important; }
     .admin-header h2 { margin: 0 !important; }
-    .admin-configuration { min-height: 0 !important; padding: 9px 14px; border: 1px solid #e1e1e1; background: #fafafa; line-height: 1.45; }
+    .admin-configuration, .admin-configuration * { color: #33434d !important; }
+    .admin-configuration { min-height: 0 !important; padding: 14px 18px; border: 1px solid #d8dde3; border-left: 4px solid #176b87; background: #f7fafb !important; line-height: 1.55; }
+    .admin-configuration strong { color: #1f2933 !important; }
+    .admin-configuration code { display: inline-block; margin: 2px 5px 2px 2px; padding: 3px 7px; border: 1px solid #c9dce1; border-radius: 3px; background: #eaf5f7 !important; color: #176b87 !important; font-family: inherit; font-weight: 700; }
     .admin-configuration p { margin: 2px 0 !important; }
     .admin-status { margin: 8px 0; padding: 9px 12px; border-left: 4px solid #9c0014; background: #fff5f6; }
     .admin-downloads { margin: 10px 0 16px; padding: 8px; border-top: 1px solid #e5e5e5; border-bottom: 1px solid #e5e5e5; }
@@ -1171,4 +1535,10 @@ with gr.Blocks() as demo:
 if __name__ == "__main__":
     server_port = int(os.getenv("GRADIO_SERVER_PORT", "7860"))
     release_port(server_port)
-    demo.launch(server_name="0.0.0.0", server_port=server_port, theme=tema_branco, css=APP_CSS, share=True)
+    demo.launch(
+                #share=True,
+                server_name="0.0.0.0", 
+                server_port=server_port, 
+                theme=tema_branco, 
+                css=APP_CSS
+    )

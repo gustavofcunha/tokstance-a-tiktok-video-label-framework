@@ -38,6 +38,28 @@ videos = [
 with (DATA_DIR / "videos.csv").open("w", encoding="utf-8", newline="") as videos_file:
     csv.writer(videos_file).writerows(videos)
 
+reserve_videos = [
+    [
+        "id",
+        "url",
+        "target",
+        "video_description",
+        "voice_to_text",
+        "video_duration",
+    ],
+    [
+        "reserve-1",
+        "https://www.tiktok.com/@test/video/reserve-1",
+        "Test target",
+        "Reserve description",
+        "Reserve transcription",
+        "11",
+    ],
+]
+
+with (DATA_DIR / "videos_reserva.csv").open("w", encoding="utf-8", newline="") as reserve_file:
+    csv.writer(reserve_file).writerows(reserve_videos)
+
 with (DATA_DIR / "configuracao.json").open("w", encoding="utf-8") as config_file:
     json.dump({
         "admins": ["admin"],

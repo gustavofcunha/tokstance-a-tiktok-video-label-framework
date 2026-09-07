@@ -13,33 +13,55 @@ The framework is intentionally adaptable. You can add or remove input features, 
 - Versioned assignments with stable `assignment_version` and `assignment_id` values.
 - Assignment regeneration when the dataset or assignment configuration changes.
 - Progress recovery between sessions, including videos reported as unavailable.
+- Replacement of unavailable videos from `data/videos_reserva.csv`, preserving the number of assignment slots.
 - Configurable stance labels. The default labels are `Contra`, `A Favor`, `Neutro`, and `Vídeo não relacionado ao target`.
 - Administrator dashboard with assignment auditing, agreement metrics, duration alerts, and downloads.
+- Administrative command center with operational KPIs, target distribution charts, workload comparison, and preventive action signals.
 - Alerts for analyses more than five seconds shorter than the video duration.
 - Ordinal Krippendorff's alpha for videos with multiple annotations.
 - Local CSV and JSON persistence, suitable for prototypes and small studies.
-
-## Adaptability
-
-The application is not tied to one research task or one fixed annotation scheme.
-
-You can adapt:
-
-- **Video features:** add, remove, or rename fields such as descriptions, transcriptions, duration, language, country, creator metadata, or extracted multimodal features.
-- **Annotation task:** change the target question, replace stance detection with another labeling task, or display task-specific instructions.
-- **Label options:** edit `STANCE_OPTIONS` in `src/app.py` or load labels from a configuration file.
-- **Assignment policy:** change overlap, balancing, ordering, sampling, or annotator eligibility rules.
-- **Storage:** replace CSV/JSON files with a database, object storage, or an API-backed repository for concurrent production use.
-- **Interface:** customize the Gradio layout, CSS, player, dashboard, and administrative controls.
-
-## How It Works
+## Usage and Workflow
 
 1. An authorized user enters an identifier.
 2. An administrator configures annotators, task text, and overlap percentage.
 3. The application assigns every video: the overlap portion is assigned to every annotator and the remaining videos are distributed in round-robin order.
 4. The annotator selects a label or reports that the video did not load.
-5. A normal annotation is saved with `assignment_version`, `assignment_id`, video duration, and analysis time. An unavailable-video report is saved in the error log with the same assignment identity.
-6. When the annotator returns, the application reads both annotation and error records and opens the first pending assignment while keeping the original queue total.
+5. A normal annotation is saved with `assignment_version`, `assignment_id`, video duration, and analysis time. An unavailable-video report is saved in the error log with the original assignment identity.
+6. When an error is reported, the application first treats all assignments of the same original video as one overlap group. If no member has been annotated, one same-target reserve is assigned to every member of that group. The error row records the replacement, and all affected annotators see the same reserve video.
+7. If one member of the overlap was already annotated, the application first tries to preserve the overlap by promoting a same-target video that was individually assigned and already annotated to every pending assignment in the affected group. This changes which video is in the overlap sample while preserving the overlap percentage and does not rewrite completed annotations.
+8. Only when those valid rearrangements are impossible does the application use a same-target reserve for the failed slot and mark `CRITICO_OVERLAP_INCONSISTENTE`; the administrator dashboard displays a critical alert for review.
+9. When the annotator returns, the application reads both annotation and error records and opens the first pending assignment while keeping the original queue total.
+Unavailable-video handling is a controlled exception to the original assignment plan. It is used only when a video cannot be annotated and only after checking the original assignment group, completed annotations, target compatibility, and available reserve videos. The application never changes a completed result, never replaces a video with another target, and records every decision in `data/erros_videos.csv`.
+
+The normal rule is to preserve the original overlap group. A same-target reserve is shared by all affected pending assignments in that group; it is not counted as multiple reserve videos. If the event order makes exact preservation impossible, the application records a critical status for administrative review instead of silently presenting the change as if it were part of the original sample.
+
+### Unavailable Video Replacement
+
+The replacement logic treats the original video and all of its assignments as one overlap group. A replacement never changes the target: reserve candidates and promoted individual videos must have the same normalized `target` as the failed assignment.
+
+```mermaid
+flowchart TD
+  A[User reports video unavailable] --> B{Was the video assigned to multiple users?}
+  B -->|No| C[Use one unused reserve with the same target]
+  C --> D{Compatible reserve exists?}
+  D -->|Yes| E[Replace only the failed assignment]
+  D -->|No| F[Keep error and record no compatible reserve]
+  B -->|Yes| G{Any valid annotation already exists in the group?}
+  G -->|No| H[Select one unused same-target reserve]
+  H --> I{Reserve exists?}
+  I -->|Yes| J[Assign the same reserve to every assignment in the group]
+  I -->|No| K[Record unavailable pool status]
+  G -->|Yes| L{Same-target individual video already annotated?}
+  L -->|Yes| M[Promote it to every pending assignment in the overlap group]
+  M --> N[Keep completed annotations unchanged]
+  L -->|No| O{Unused same-target reserve exists?}
+  O -->|Yes| P[Replace pending failed assignment and mark critical overlap alert]
+  O -->|No| Q[Keep assignment state and mark critical overlap alert]
+```
+
+In the promotion branch, the already annotated individual video remains with its original annotator and is copied only into pending slots of the affected overlap group. The completed annotation is never rewritten, and the original failed overlap video is not assigned again to users whose pending slot was promoted. This preserves the configured number of overlap videos as far as the observed data allows, while the administrator is explicitly warned whenever the event order makes exact preservation impossible.
+
+### Assignment Rules
 
 For `N` videos and overlap percentage `p`, the number of shared videos is `floor(N * p / 100)`. The remaining videos receive one assignment each. For example, 36 videos with 50% overlap and two annotators produce 18 shared videos, 18 single-annotator videos, and 54 total assignments, with 27 assignments per annotator.
 
@@ -63,42 +85,56 @@ This prevents annotations from an old dataset or old assignment configuration fr
 
 ### Rebuilding Assignments Safely
 
-To start a new assignment round:
+To start a new assignment round, change at least one input that defines the assignment version, such as the video dataset, annotator list, or overlap percentage. Then:
 
 1. Prepare the new `data/videos.csv` and review its order and IDs.
 2. Update annotators or overlap in `data/configuracao.json`, or use the administrator panel.
-3. Save the configuration or restart the application so the assignment version is regenerated.
+3. Save the changed configuration or restart the application after changing the inputs. The new version is generated because the dataset or assignment configuration changed, not because the application restarted.
 4. Review `data/atribuicoes.csv` and confirm its `assignment_version`, row count, and per-annotator distribution.
 5. Keep previous results as historical data. Do not delete them unless the study protocol explicitly requires it.
 
+Restarting the application with the same `videos.csv` and assignment configuration does not create a new round. The assignment version and assignment IDs remain the same, and the existing manifest is reused. This allows the application to recover the current queues without invalidating annotations already collected.
+
 For a major study round, keep an external snapshot of the input dataset, configuration, assignments, results, and errors together with the assignment version.
 
-## Input File: `data/videos.csv`
+## Data Files
 
-The required columns are:
+### Input File Schema
 
-```csv
-id,url,target
-1234567890123456789,https://www.tiktok.com/@creator/video/1234567890123456789,example target
-```
+Both required input files, `data/videos.csv` and `data/videos_reserva.csv`, use the same schema:
 
-The following columns are optional:
+| Column | Requirement | Description |
+| --- | --- | --- |
+| `id` | Required | Unique video identifier. |
+| `url` | Required | Public TikTok URL used by the player. |
+| `target` | Required | Topic, claim, or entity used as the annotation target. |
+| `video_description` | Optional | Description or caption published by the creator. |
+| `voice_to_text` | Optional | Audio transcription; it may contain recognition errors. |
+| `video_duration` | Optional | Duration in seconds, used for analysis-time alerts when available. |
+
+Each file must contain the header and at least one data row. The application aborts before opening the interface if either file is missing, malformed, empty, or has no data rows.
+
+Example primary input:
 
 ```csv
 id,url,target,video_description,voice_to_text,video_duration
 1234567890123456789,https://www.tiktok.com/@creator/video/1234567890123456789,example target,Post description,Audio transcription,30
 ```
 
-- `id`: required unique video identifier.
-- `url`: required public TikTok URL used by the player.
-- `target`: required topic, claim, or entity used as the annotation target.
-- `video_description`: optional description or caption published by the creator.
-- `voice_to_text`: optional audio transcription. It may contain recognition errors.
-- `video_duration`: optional duration in seconds. It is used for analysis-time alerts when available.
+Example reserve input:
 
-If an optional column is absent, the interface displays an appropriate unavailable message and the rest of the annotation flow continues.
+```csv
+id,url,target,video_description,voice_to_text,video_duration
+reserve-001,https://www.tiktok.com/@creator/video/reserve-001,example target,,,30
+```
 
-The application reads data from `data/` by default. For deployments or tests that keep data elsewhere, set `TOKSTANCE_DATA_DIR` to a directory containing `videos.csv` and, optionally, `configuracao.json`:
+Optional columns may be absent. In that case, the interface displays an appropriate unavailable message and the rest of the annotation flow continues.
+
+`videos_reserva.csv` contains fallback videos used when an annotator reports an unavailable video. Reserve videos must follow the same schema and target-compatibility rules described in [Unavailable Video Replacement](#unavailable-video-replacement).
+
+### Data Directory
+
+The application reads data from `data/` by default. For deployments or tests that keep data elsewhere, set `TOKSTANCE_DATA_DIR` to a directory containing both required input files and, optionally, `configuracao.json`:
 
 ```bash
 TOKSTANCE_DATA_DIR=/secure/tokstance-data python3 src/app.py
@@ -106,13 +142,10 @@ TOKSTANCE_DATA_DIR=/secure/tokstance-data python3 src/app.py
 
 The player requires internet access in the annotator's browser. A video that does not load can be reported in the interface; that event is persisted and counts toward progress recovery.
 
-## Sensitive and Generated Files
+### Input and Configuration
 
 These files may contain research data, URLs, user identifiers, annotations, configuration, or access logs. They are local runtime files and are listed in `.gitignore`. Do not publish or share them without authorization.
 
-### Input and Configuration
-
-- `data/videos.csv`: sensitive input dataset. Template columns are `id,url,target`; optional feature columns are `video_description,voice_to_text,video_duration`. The application accepts additional columns for future adaptations, but only configured fields are displayed or persisted automatically.
 - `data/configuracao.json`: JSON configuration template containing `admins`, `labelers`, `videos_per_labeler`, `overlap_percent`, and `tarefa`. `videos_per_labeler` is calculated from the active assignment set and should not be treated as the primary assignment control.
 
 Example configuration:
@@ -131,11 +164,37 @@ Example configuration:
 
 - `data/atribuicoes.csv`: current assignment manifest. It contains `assignment_version`, `assignment_id`, `labeler`, `video_id`, `url`, `target`, optional feature fields, and `video_duration`. It is regenerated from the current dataset and configuration.
 - `data/resultados_anotacao.csv`: normal annotation records. Template columns are `timestamp,labeler,video_id,url,target,stance,tempo_analise_segundos,video_duration,assignment_id`. The application migrates legacy rows when possible.
-- `data/erros_videos.csv`: unavailable-video records. Template columns are `timestamp,video_id,url,labeler,assignment_id`. Legacy four-column rows are also read for compatibility.
+- `data/erros_videos.csv`: unavailable-video records. Template columns are `timestamp,video_id,url,labeler,assignment_id,replacement_video_id,replacement_url,replacement_assignment_id,replacement_status`. Legacy four-column rows are also read for compatibility. `replacement_status` can be `SUBSTITUIDO_OVERLAP` for a shared same-target replacement, `SUBSTITUIDO_OVERLAP_REBALANCEADO` for a scientifically valid reassignment using an already annotated individual video, `CRITICO_OVERLAP_INCONSISTENTE` when neither approach can preserve the overlap, `SEM_RESERVA_DISPONIVEL` when the pool was exhausted, or `SEM_RESERVA_COMPATIVEL` when available reserves have another target.
 - `data/acessos_log.csv`: access and timing events with `timestamp,usuario,acao,tempo_desde_login_segundos`.
 - `data/concordancia.json`: generated report containing the agreement metric, comparable videos, discordant videos, and annotators with the highest disagreement.
 
-## Local Development and Useful Commands
+## Administration and Analytics
+
+The administrator dashboard is read-only. Configuration and assignment generation remain external to the interface; the dashboard lets administrators select an assignment round and inspect its data.
+
+The disagreement analysis uses the following explicit distance matrix:
+
+| Pair of labels | Distance / penalty |
+| --- | ---: |
+| Same label | 0 |
+| `Contra` vs. `Neutro` | 1 |
+| `Neutro` vs. `A Favor` | 1 |
+| `Contra` vs. `A Favor` | 4 |
+| `Vídeo não relacionado ao target` vs. any stance | 3 |
+
+The video score is the mean pairwise distance between annotations for that video. The annotator penalty is the sum of each annotator's mean distance to the other annotations on the same videos. Therefore, a polar disagreement between `Contra` and `A Favor` is penalized more heavily than a disagreement involving `Neutro`. The dashboard ranks annotators with the highest accumulated penalty and videos with the highest weighted divergence.
+
+The dashboard also includes visual summaries of:
+
+- assignment progress by annotator, including completed and pending videos;
+- weighted disagreement by annotator and video;
+- logins per day;
+- number of active days per annotator;
+- average session time based on the access log.
+
+The test suite creates a small synthetic dataset and configuration in `tests/.test-data/` through `tests/conftest.py`. These fixtures are intentionally fake and are ignored by Git; the real `videos.csv` and runtime data are never required by CI.
+
+## Local Development
 
 ```bash
 python3 -m venv venv
@@ -170,7 +229,7 @@ tmux kill-session -t sessao-teste
 
 Run `tmux attach` before `tmux kill-session` when you need to inspect the running application. After a session is killed, it can no longer be attached.
 
-## Tests
+## Testing
 
 The repository separates tests by scope:
 
@@ -189,9 +248,6 @@ Unit tests in `tests/unit/` validate deterministic assignment logic without open
 - overlap produces the expected number of shared assignments;
 - workload is balanced between annotators;
 - a changed dataset creates a new `assignment_version` and new assignment IDs.
-
-Run only unit tests with:
-
 ```bash
 pytest -q tests/unit
 ```
@@ -204,8 +260,6 @@ Integration tests in `tests/integration/` validate behavior across assignment ge
 - a normal annotation resumes at the first current pending assignment;
 - an unavailable-video record counts as completed for the current assignment.
 
-Run only integration tests with:
-
 ```bash
 pytest -q tests/integration
 ```
@@ -217,8 +271,6 @@ System tests in `tests/system/` validate the application-facing contract without
 - the labeler queue can be constructed from the configured dataset;
 - the video HTML uses the official TikTok player endpoint;
 - description, transcription, assignment version, progress, and target question are exposed to the interface.
-
-Run only system tests with:
 
 ```bash
 pytest -q tests/system
@@ -235,33 +287,7 @@ pytest -q
 
 `pytest.ini` adds the repository root to the Python path and restricts discovery to `tests/`.
 
-### Administrative Analytics
-
-The administrator dashboard is read-only. Configuration and assignment generation remain external to the interface; the dashboard lets administrators select an assignment round and inspect its data.
-
-The disagreement analysis uses the following explicit distance matrix:
-
-| Pair of labels | Distance / penalty |
-| --- | ---: |
-| Same label | 0 |
-| `Contra` vs. `Neutro` | 1 |
-| `Neutro` vs. `A Favor` | 1 |
-| `Contra` vs. `A Favor` | 4 |
-| `Vídeo não relacionado ao target` vs. any stance | 3 |
-
-The video score is the mean pairwise distance between annotations for that video. The annotator penalty is the sum of each annotator's mean distance to the other annotations on the same videos. Therefore, a polar disagreement between `Contra` and `A Favor` is penalized more heavily than a disagreement involving `Neutro`. The dashboard ranks annotators with the highest accumulated penalty and videos with the highest weighted divergence.
-
-The dashboard also includes visual summaries of:
-
-- assignment progress by annotator, including completed and pending videos;
-- weighted disagreement by annotator and video;
-- logins per day;
-- number of active days per annotator;
-- average session time based on the access log.
-
-The test suite creates a small synthetic dataset and configuration in `tests/.test-data/` through `tests/conftest.py`. These fixtures are intentionally fake and are ignored by Git; the real `videos.csv` and runtime data are never required by CI.
-
-### Continuous integration
+### Continuous Integration
 
 `.github/workflows/ci.yml` runs automatically on every `push` and `pull_request`. The workflow tests Python `3.10`, `3.11`, and `3.12`, installs `requirements.txt`, compiles `src/app.py`, and runs the full pytest suite. A commit or pull request is considered healthy only when all matrix jobs pass.
 

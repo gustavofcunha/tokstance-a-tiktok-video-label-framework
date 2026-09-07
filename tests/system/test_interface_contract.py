@@ -13,3 +13,13 @@ def test_labeler_interface_contract():
     assert "assignment_version" in queue[0]
     assert "de" in progress
     assert "<strong>" in question
+
+
+def test_admin_dashboard_exposes_operational_insights():
+    dashboard = app.agreement_summary(app.read_results())
+
+    assert "Leitura operacional da rodada" in dashboard
+    assert "Cobertura da rodada" in dashboard
+    assert "Conclusão por rotulador" in dashboard
+    assert "Distribuição das posições" in dashboard
+    assert "Sinais para ação" in dashboard
