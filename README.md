@@ -1,7 +1,7 @@
-# TokStance! 
+# TokStance!! 
 ##  A Open-Source Multimodal Stance Annotation Framework
 
-TokStance is an open-source Gradio framework for collaborative stance annotation of TikTok videos. Annotators classify the creator's position in relation to a target while considering the post description, transcription, audio, visual elements, and context.
+TokStance! is an open-source Gradio framework for collaborative stance annotation of TikTok videos. Annotators classify the creator's position in relation to a target while considering the post description, transcription, audio, visual elements, and context.
 
 The framework is intentionally adaptable. You can add or remove input features, change the annotation task, replace or extend the label options, customize the assignment policy, and adapt the persistence layer to the needs of your study.
 
