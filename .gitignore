@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+tests/.test-data/
 
 # Research input and runtime data
 videos.csv

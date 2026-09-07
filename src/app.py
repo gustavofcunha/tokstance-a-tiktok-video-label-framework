@@ -2,6 +2,7 @@ import json
 import csv
 import hashlib
 import math
+import os
 import threading
 import time
 import requests
@@ -15,7 +16,7 @@ import pandas as pd
 # ==============================================================================
 # CONFIGURAÇÕES E ARQUIVOS BASE
 # ==============================================================================
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = Path(os.getenv("TOKSTANCE_DATA_DIR", Path(__file__).resolve().parent.parent))
 VIDEOS_FILE = BASE_DIR / "videos.csv"
 RESULTS_FILE = BASE_DIR / "resultados_anotacao.csv"
 ASSIGNMENTS_FILE = BASE_DIR / "atribuicoes.csv"

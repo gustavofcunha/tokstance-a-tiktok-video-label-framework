@@ -96,6 +96,12 @@ id,url,target,video_description,voice_to_text,video_duration
 
 If an optional column is absent, the interface displays an appropriate unavailable message and the rest of the annotation flow continues.
 
+The application reads data from the project root by default. For deployments or tests that keep data elsewhere, set `TOKSTANCE_DATA_DIR` to a directory containing `videos.csv` and, optionally, `configuracao.json`:
+
+```bash
+TOKSTANCE_DATA_DIR=/secure/tokstance-data python3 src/app.py
+```
+
 The player requires internet access in the annotator's browser. A video that does not load can be reported in the interface; that event is persisted and counts toward progress recovery.
 
 ## Sensitive and Generated Files
@@ -202,6 +208,8 @@ pytest -q
 ```
 
 `pytest.ini` adds the repository root to the Python path and restricts discovery to `tests/`.
+
+The test suite creates a small synthetic dataset and configuration in `tests/.test-data/` through `tests/conftest.py`. These fixtures are intentionally fake and are ignored by Git; the real `videos.csv` and runtime data are never required by CI.
 
 ### Continuous integration
 
