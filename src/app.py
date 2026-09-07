@@ -3,6 +3,8 @@ import csv
 import hashlib
 import math
 import os
+import socket
+import subprocess
 import threading
 import time
 import requests
@@ -16,7 +18,8 @@ import pandas as pd
 # ==============================================================================
 # CONFIGURAÇÕES E ARQUIVOS BASE
 # ==============================================================================
-BASE_DIR = Path(os.getenv("TOKSTANCE_DATA_DIR", Path(__file__).resolve().parent.parent))
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = Path(os.getenv("TOKSTANCE_DATA_DIR") or PROJECT_DIR / "data")
 VIDEOS_FILE = BASE_DIR / "videos.csv"
 RESULTS_FILE = BASE_DIR / "resultados_anotacao.csv"
 ASSIGNMENTS_FILE = BASE_DIR / "atribuicoes.csv"
@@ -26,6 +29,8 @@ ERRORS_FILE = BASE_DIR / "erros_videos.csv"
 AGREEMENT_FILE = BASE_DIR / "concordancia.json"
 
 FILE_LOCK = threading.Lock()
+ACTIVE_USERS = set()
+ACTIVE_USERS_LOCK = threading.Lock()
 STANCE_OPTIONS = [
     "Contra",
     "A Favor",
@@ -96,6 +101,20 @@ def registrar_log(username, acao, tempo_sessao=0.0):
     columns = ["timestamp", "usuario", "acao", "tempo_desde_login_segundos"]
     with FILE_LOCK:
         append_csv_row(LOG_FILE, row, columns)
+
+
+def claim_active_user(username):
+    """Atomically reserves a username for one active browser session."""
+    with ACTIVE_USERS_LOCK:
+        if username in ACTIVE_USERS:
+            return False
+        ACTIVE_USERS.add(username)
+        return True
+
+
+def release_active_user(username):
+    with ACTIVE_USERS_LOCK:
+        ACTIVE_USERS.discard(username)
 
 
 def assignment_version(config, videos):
@@ -225,7 +244,7 @@ def render_tiktok(url):
     return html
 
 
-def render_video_card(item):
+def render_video_card(item, highlight_target=False):
     description = str(item.get("video_description", "")).strip()
     transcription = str(item.get("voice_to_text", "")).strip()
     description_html = escape(description).replace("\n", "<br>") if description else "Descrição não disponível em videos.csv."
@@ -234,7 +253,7 @@ def render_video_card(item):
     transcription_class = "video-transcription" if transcription else "video-transcription unavailable"
     return f"""
     <div class='video-card'>
-        <div class='video-meta'><strong>Target:</strong> {escape(str(item.get('target', '')))}</div>
+        <div class='video-meta{' target-transition' if highlight_target else ''}'><strong>Target:</strong> {escape(str(item.get('target', '')))}</div>
         <div class='video-content-grid'>
             <div class='video-context-column'>
                 <div class='{description_class}'><strong>Descrição do vídeo</strong><div>{description_html}</div></div>
@@ -254,31 +273,102 @@ def make_assignments(config, videos):
     if not labelers or len(videos) == 0:
         return pd.DataFrame(columns=assignment_columns)
 
+    target_buckets = {}
+    target_order = []
+    for video_index, target in enumerate(videos["target"].astype(str).tolist()):
+        target_key = target.strip()
+        if target_key not in target_buckets:
+            target_buckets[target_key] = []
+            target_order.append(target_key)
+        target_buckets[target_key].append(video_index)
+
+    balanced_video_order = []
+    while any(target_buckets[target_key] for target_key in target_order):
+        for target_key in target_order:
+            if target_buckets[target_key]:
+                balanced_video_order.append(target_buckets[target_key].pop(0))
+
     overlap_count = int((overlap_percent / 100.0) * len(videos))
+    overlap_indices = balanced_video_order[:overlap_count]
+    individual_indices = balanced_video_order[overlap_count:]
+    labeler_target_counts = {labeler: {target_key: 0 for target_key in target_order} for labeler in labelers}
+    labeler_totals = {labeler: 0 for labeler in labelers}
+    individual_assignments = {}
+    for video_index in individual_indices:
+        target_key = str(videos.iloc[video_index]["target"]).strip()
+        labeler = min(labelers, key=lambda candidate: (
+            labeler_target_counts[candidate][target_key],
+            labeler_totals[candidate],
+            labelers.index(candidate),
+        ))
+        individual_assignments[video_index] = labeler
+        labeler_target_counts[labeler][target_key] += 1
+        labeler_totals[labeler] += 1
 
     assignments = []
-
-    for video_index in range(overlap_count):
-        video = videos.iloc[video_index]
+    for video_index in overlap_indices:
         for labeler in labelers:
-            assignments.append({
-                "assignment_version": version, "assignment_id": assignment_identifier(version, labeler, video["id"]), "labeler": labeler, "video_id": str(video["id"]), "url": video["url"], "target": video["target"], "video_description": video.get("video_description", ""), "voice_to_text": video.get("voice_to_text", ""), "video_duration": video.get("video_duration", "")
-            })
+            assignments.append((labeler, video_index))
+    assignments.extend((labeler, video_index) for video_index, labeler in individual_assignments.items())
 
-    for offset, video_index in enumerate(range(overlap_count, len(videos))):
-        labeler = labelers[offset % len(labelers)]
-        video = videos.iloc[video_index]
-        assignments.append({
-            "assignment_version": version, "assignment_id": assignment_identifier(version, labeler, video["id"]), "labeler": labeler, "video_id": str(video["id"]), "url": video["url"], "target": video["target"], "video_description": video.get("video_description", ""), "voice_to_text": video.get("voice_to_text", ""), "video_duration": video.get("video_duration", "")
-        })
-
-    result = pd.DataFrame(assignments, columns=assignment_columns)
+    target_rank = {target_key: rank for rank, target_key in enumerate(target_order)}
+    assignments.sort(key=lambda item: (labelers.index(item[0]), target_rank[str(videos.iloc[item[1]]["target"]).strip()], item[1]))
+    result = pd.DataFrame([
+        {
+            "assignment_version": version,
+            "assignment_id": assignment_identifier(version, labeler, videos.iloc[video_index]["id"]),
+            "labeler": labeler,
+            "video_id": str(videos.iloc[video_index]["id"]),
+            "url": videos.iloc[video_index]["url"],
+            "target": videos.iloc[video_index]["target"],
+            "video_description": videos.iloc[video_index].get("video_description", ""),
+            "voice_to_text": videos.iloc[video_index].get("voice_to_text", ""),
+            "video_duration": videos.iloc[video_index].get("video_duration", ""),
+        }
+        for labeler, video_index in assignments
+    ], columns=assignment_columns)
     result = result.drop_duplicates(subset=["labeler", "video_id"], keep="last").reset_index(drop=True)
     result.to_csv(ASSIGNMENTS_FILE, index=False)
     return result
 
 def load_assignments(config, videos):
     return make_assignments(config, videos)
+
+
+LABEL_DISTANCE = {
+    frozenset(("Contra", "Neutro")): 1.0,
+    frozenset(("Neutro", "A Favor")): 1.0,
+    frozenset(("Contra", "A Favor")): 4.0,
+    frozenset(("Vídeo não relacionado ao target", "Contra")): 3.0,
+    frozenset(("Vídeo não relacionado ao target", "Neutro")): 3.0,
+    frozenset(("Vídeo não relacionado ao target", "A Favor")): 3.0,
+}
+
+
+def label_distance(left, right):
+    if left == right:
+        return 0.0
+    return LABEL_DISTANCE.get(frozenset((left, right)), 0.0)
+
+
+def assignment_versions(assignments, results, errors):
+    versions = []
+    current_version = None
+    if not assignments.empty and "assignment_version" in assignments:
+        versions.extend(assignments["assignment_version"].dropna().astype(str).tolist())
+        current_version = versions[0] if versions else None
+    for frame in (results, errors):
+        if not frame.empty and "assignment_id" in frame:
+            versions.extend(frame["assignment_id"].astype(str).str.split(":", n=1).str[0].tolist())
+    available = {version for version in versions if version and version != "legacy"}
+    available.discard(current_version)
+    return ([current_version] if current_version else []) + sorted(available, reverse=True)
+
+
+def filter_by_assignment_version(frame, version):
+    if frame.empty or not version or "assignment_id" not in frame:
+        return frame.copy()
+    return frame[frame["assignment_id"].astype(str).str.startswith(f"{version}:")].copy()
 
 
 def calculate_agreement(results):
@@ -296,7 +386,7 @@ def calculate_agreement(results):
         distances = []
         for left_index in range(len(labels)):
             for right_index in range(left_index + 1, len(labels)):
-                distances.append((category_order[labels[left_index]] - category_order[labels[right_index]]) ** 2)
+                distances.append(label_distance(labels[left_index], labels[right_index]))
         observed_disagreement += sum(distances)
         pair_count += len(distances)
         if any(distance > 0 for distance in distances):
@@ -304,7 +394,7 @@ def calculate_agreement(results):
 
     all_labels = [label for labels in usable for label in labels]
     expected_disagreement = sum(
-        (category_order[all_labels[left_index]] - category_order[all_labels[right_index]]) ** 2
+        label_distance(all_labels[left_index], all_labels[right_index])
         for left_index in range(len(all_labels))
         for right_index in range(left_index + 1, len(all_labels))
     )
@@ -317,11 +407,12 @@ def calculate_agreement(results):
         labels = video_results["stance"].tolist()
         for row in video_results.itertuples():
             other_labels = [label for label in labels if label != row.stance]
-            if other_labels and row.stance != max(set(other_labels), key=other_labels.count):
-                labeler_disagreements[row.labeler] = labeler_disagreements.get(row.labeler, 0) + 1
-    labelers = [{"labeler": labeler, "discordancias": count} for labeler, count in labeler_disagreements.items()]
-    labelers.sort(key=lambda item: item["discordancias"], reverse=True)
-    return {"metrica": "Alfa de Krippendorff (ordinal)", "alfa": round(alpha, 6) if alpha is not None else None, "videos_com_multiplas_anotacoes": int(len(usable)), "anotacoes_consideradas": int(len(all_labels)), "videos_com_discordancia": disagreement_videos, "labelers_com_maior_discordancia": labelers}
+            if other_labels:
+                score = sum(label_distance(row.stance, label) for label in other_labels) / len(other_labels)
+                labeler_disagreements[row.labeler] = labeler_disagreements.get(row.labeler, 0.0) + score
+    labelers = [{"labeler": labeler, "penalidade": round(score, 2)} for labeler, score in labeler_disagreements.items()]
+    labelers.sort(key=lambda item: item["penalidade"], reverse=True)
+    return {"metrica": "Concordância ponderada por distância", "alfa": round(alpha, 6) if alpha is not None else None, "videos_com_multiplas_anotacoes": int(len(usable)), "anotacoes_consideradas": int(len(all_labels)), "videos_com_discordancia": disagreement_videos, "labelers_com_maior_discordancia": labelers}
 
 
 def find_fast_annotations(results, videos, tolerance_seconds=5.0):
@@ -346,20 +437,135 @@ def find_fast_annotations(results, videos, tolerance_seconds=5.0):
     return sorted(alerts, key=lambda item: item["diferenca_segundos"], reverse=True)
 
 
-def agreement_summary(results):
-    agreement = calculate_agreement(results)
+def load_access_log():
+    columns = ["timestamp", "usuario", "acao", "tempo_desde_login_segundos"]
+    if not LOG_FILE.exists() or LOG_FILE.stat().st_size == 0:
+        return pd.DataFrame(columns=columns)
+    try:
+        log = pd.read_csv(LOG_FILE, dtype=str).fillna("")
+        if not set(columns).issubset(log.columns):
+            return pd.DataFrame(columns=columns)
+        log["timestamp"] = pd.to_datetime(log["timestamp"], errors="coerce")
+        log["tempo_desde_login_segundos"] = pd.to_numeric(log["tempo_desde_login_segundos"], errors="coerce").fillna(0.0)
+        return log.dropna(subset=["timestamp"])
+    except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+        return pd.DataFrame(columns=columns)
+
+
+def access_statistics():
+    log = load_access_log()
+    if log.empty:
+        return {"session_rows": "<p class='muted'>Ainda não há dados de acesso.</p>", "daily_rows": "<p class='muted'>Ainda não há dados de acesso.</p>", "avg_minutes": 0.0}
+    login_events = log[log["acao"].eq("LOGIN_LABELER") | log["acao"].eq("LOGIN_ADMIN")].copy()
+    daily = login_events.assign(dia=login_events["timestamp"].dt.strftime("%Y-%m-%d")).groupby("dia").size().to_dict()
+    daily_max = max(daily.values(), default=1)
+    daily_rows = "".join(
+        f"<div class='bar-row'><span>{escape(day)}</span><div class='bar-track'><div class='bar-fill' style='width:{count / daily_max:.0%}'></div></div><strong>{count}</strong></div>"
+        for day, count in sorted(daily.items())
+    ) or "<p class='muted'>Nenhum login registrado.</p>"
+    sessions = []
+    for index, login in login_events.iterrows():
+        next_login = login_events[login_events.index > index]
+        end = next_login.iloc[0]["timestamp"] if not next_login.empty else None
+        events = log[(log.index >= index) & (log["usuario"] == login["usuario"])]
+        events = events[events["timestamp"] >= login["timestamp"]]
+        if end is not None:
+            events = events[events["timestamp"] < end]
+        duration = float(events["tempo_desde_login_segundos"].max()) if not events.empty else 0.0
+        sessions.append({"usuario": login["usuario"], "timestamp": login["timestamp"], "duracao": duration})
+    session_frame = pd.DataFrame(sessions)
+    avg_minutes = session_frame["duracao"].mean() / 60 if not session_frame.empty else 0.0
+    user_rows = "".join(
+        f"<tr><td>{escape(str(user))}</td><td>{len(rows)}</td><td>{rows['duracao'].mean() / 60:.1f} min</td><td>{rows['timestamp'].dt.strftime('%Y-%m-%d').nunique()}</td></tr>"
+        for user, rows in session_frame.groupby("usuario")
+    )
+    session_rows = f"<table class='progress-table'><thead><tr><th>Usuário</th><th>Logins</th><th>Média logado</th><th>Dias ativos</th></tr></thead><tbody>{user_rows}</tbody></table>"
+    return {"session_rows": session_rows, "daily_rows": daily_rows, "avg_minutes": avg_minutes}
+
+
+def assignment_table_for_version(assignments, results, errors, version):
+    if version and not assignments.empty and version in set(assignments["assignment_version"].astype(str)):
+        return assignments[assignments["assignment_version"].astype(str).eq(version)]
+    rows = pd.concat([filter_by_assignment_version(results, version), filter_by_assignment_version(errors, version)], ignore_index=True)
+    return rows
+
+
+def annotation_daily_chart(results):
+    if results.empty or not {"timestamp", "labeler"}.issubset(results.columns):
+        return "<p class='muted'>Ainda não há anotações para desenhar a série diária.</p>"
+    daily = results.copy()
+    daily["timestamp"] = pd.to_datetime(daily["timestamp"], errors="coerce")
+    daily = daily.dropna(subset=["timestamp"])
+    if daily.empty:
+        return "<p class='muted'>Ainda não há anotações para desenhar a série diária.</p>"
+    daily["dia"] = daily["timestamp"].dt.strftime("%Y-%m-%d")
+    counts = daily.groupby(["dia", "labeler"]).size().reset_index(name="quantidade")
+    labelers = sorted(counts["labeler"].astype(str).unique())
+    colors = ["#9c0014", "#176b87", "#b56b00", "#4f6f52", "#704c8a", "#8b5e3c"]
+    color_map = {labeler: colors[index % len(colors)] for index, labeler in enumerate(labelers)}
+    max_count = max(int(counts["quantidade"].max()), 1)
+    legend = "".join(
+        f"<span class='chart-legend-item'><i style='background:{color_map[labeler]}'></i>{escape(labeler)}</span>"
+        for labeler in labelers
+    )
+    days = []
+    for day, day_rows in counts.groupby("dia", sort=True):
+        values = dict(zip(day_rows["labeler"].astype(str), day_rows["quantidade"]))
+        bars = "".join(
+            f"<div class='daily-bar-row'><span>{escape(labeler)}</span><div class='daily-bar-track'><div class='daily-bar-fill' style='width:{values.get(labeler, 0) / max_count:.0%}; background:{color_map[labeler]}'></div></div><strong>{int(values.get(labeler, 0))}</strong></div>"
+            for labeler in labelers
+        )
+        days.append(f"<div class='daily-annotation-day'><div class='daily-day-label'>{escape(day)}<span>{int(day_rows['quantidade'].sum())} no total</span></div>{bars}</div>")
+    return f"<div class='chart-legend'>{legend}</div>{''.join(days)}"
+
+
+def agreement_summary(results, selected_version=None):
+    config = load_config()
+    videos = load_videos()
+    assignments = load_assignments(config, videos)
+    errors = read_error_assignments()
+    versions = assignment_versions(assignments, results, errors)
+    version = selected_version if selected_version in versions else (versions[0] if versions else None)
+    version_results = filter_by_assignment_version(results, version)
+    version_errors = filter_by_assignment_version(errors, version)
+    agreement = calculate_agreement(version_results)
     with AGREEMENT_FILE.open("w", encoding="utf-8") as agreement_file:
         json.dump(agreement, agreement_file, ensure_ascii=False, indent=2)
+    selected_assignments = assignments[assignments["assignment_version"].astype(str).eq(version)] if version and not assignments.empty else pd.DataFrame()
+    completed_ids = set(version_results.get("assignment_id", pd.Series(dtype=str)).astype(str).str.strip())
+    completed_ids.update(version_errors.get("assignment_id", pd.Series(dtype=str)).astype(str).str.strip())
+    assignment_progress = ""
+    if assignments.empty:
+        assignment_progress = "<p class='muted'>Nenhuma atribuição ativa nesta rodada.</p>"
+    else:
+        progress_rows = []
+        progress_source = selected_assignments if not selected_assignments.empty else assignment_table_for_version(assignments, version_results, version_errors, version)
+        for labeler, labeler_assignments in progress_source.groupby("labeler", sort=False):
+            assigned = len(labeler_assignments)
+            completed = int(labeler_assignments["assignment_id"].isin(completed_ids).sum())
+            pending = assigned - completed
+            progress_rows.append(
+                f"<tr><td><strong>{escape(str(labeler))}</strong></td><td>{assigned}</td><td>{completed}</td><td>{pending}</td><td><strong>{completed / assigned:.0%}</strong></td></tr>"
+            )
+        assignment_progress = f"""
+        <table class='progress-table'>
+            <thead><tr><th>Rotulador</th><th>Atribuídos</th><th>Concluídos</th><th>Pendentes</th><th>Progresso</th></tr></thead>
+            <tbody>{''.join(progress_rows)}</tbody>
+        </table>
+        """
+    assignment_version = version or "nenhuma"
+    access = access_statistics()
+    daily_annotation_chart = annotation_daily_chart(version_results)
     alpha = "ainda não calculável" if agreement["alfa"] is None else f"{agreement['alfa']:.3f}"
     labeler_rows = "".join(
-        f"<tr><td>{item['labeler']}</td><td>{item['discordancias']}</td></tr>"
+        f"<tr><td>{escape(str(item['labeler']))}</td><td>{item['penalidade']:.2f}</td></tr>"
         for item in agreement["labelers_com_maior_discordancia"][:10]
     ) or "<tr><td colspan='2' class='muted'>Ainda não há discordâncias mensuráveis.</td></tr>"
     video_rows = "".join(
         f"<tr><td>{item['video_id']}</td><td>{' · '.join(item['anotacoes'])}</td><td>{item['discordancia_ordinal']:.2f}</td></tr>"
         for item in agreement["videos_com_discordancia"][:10]
     ) or "<tr><td colspan='3' class='muted'>Ainda não há vídeos com múltiplas anotações discordantes.</td></tr>"
-    fast_annotations = find_fast_annotations(results, load_videos())
+    fast_annotations = find_fast_annotations(version_results, videos)
     fast_warning = ""
     if fast_annotations:
         fast_rows = "".join(
@@ -375,22 +581,34 @@ def agreement_summary(results):
         """
     return f"""
     <section class='agreement-dashboard'>
+        <section class='assignment-progress'>
+            <div class='section-heading'><div><span class='section-eyebrow'>Rodada ativa</span><h3>Progresso dos rotuladores</h3></div><span class='version-label'>{escape(assignment_version)}</span></div>
+            {assignment_progress}
+        </section>
+        <p class='metric-note'><strong>Como calculamos:</strong> pares iguais = 0; Contra–Neutro e Neutro–A Favor = 1; Contra–A Favor = 4; “não relacionado” contra uma posição = 3. A penalidade do anotador é a média da distância entre sua resposta e as demais no mesmo vídeo.</p>
         {fast_warning}
         <div class='agreement-kpis'>
-            <div class='kpi'><span>Alfa ordinal</span><strong>{alpha}</strong></div>
+            <div class='kpi'><span>Concordância ponderada</span><strong>{alpha}</strong></div>
             <div class='kpi'><span>Vídeos comparáveis</span><strong>{agreement['videos_com_multiplas_anotacoes']}</strong></div>
             <div class='kpi'><span>Anotações consideradas</span><strong>{agreement['anotacoes_consideradas']}</strong></div>
         </div>
         <div class='dashboard-grid'>
             <section class='dashboard-card'>
-                <h3>Rotuladores que mais destoam</h3>
-                <table><thead><tr><th>Rotulador</th><th>Discordâncias</th></tr></thead><tbody>{labeler_rows}</tbody></table>
+                <h3>Anotadores com maior penalidade</h3>
+                <table><thead><tr><th>Anotador</th><th>Penalidade acumulada</th></tr></thead><tbody>{labeler_rows}</tbody></table>
             </section>
             <section class='dashboard-card'>
                 <h3>Vídeos com maior discordância</h3>
                 <table><thead><tr><th>Vídeo</th><th>Anotações</th><th>Distância</th></tr></thead><tbody>{video_rows}</tbody></table>
             </section>
         </div>
+        <section class='analytics-grid'>
+            <section class='dashboard-card daily-annotation-chart'><h3>Vídeos concluídos por dia e rotulador</h3><p class='metric-note'>Cada barra mostra quantos vídeos foram registrados por pessoa em cada dia da rodada selecionada.</p>{daily_annotation_chart}</section>
+        </section>
+        <section class='analytics-grid'>
+            <section class='dashboard-card'><h3>Logins por dia</h3><p class='metric-note'>Barras representam a quantidade diária de entradas.</p>{access['daily_rows']}</section>
+            <section class='dashboard-card'><h3>Sessões por anotador</h3><p class='metric-note'>Média geral: {access['avg_minutes']:.1f} min por sessão.</p>{access['session_rows']}</section>
+        </section>
     </section>
     """
 
@@ -464,7 +682,9 @@ def video_outputs(queue, position, username_clean):
     pergunta_markdown = f'<div class="target-question">Com relação ao target <strong>"{escape(target)}"</strong>, como você classifica a posição deste vídeo?</div>'
     pb = generate_progress_bar(position, total)
 
-    return position, render_video_card(item), gr.update(visible=True), pergunta_markdown, pb
+    previous_target = str(queue[position - 1].get("target", "")).strip() if position > 0 else ""
+    target_changed = position > 0 and previous_target != target.strip()
+    return position, render_video_card(item, target_changed), gr.update(visible=True), pergunta_markdown, pb
 
 # ==============================================================================
 # EVENTOS DA INTERFACE
@@ -476,31 +696,33 @@ def authenticate(username):
     agora = time.time()
 
     blank_admin = (
-        "\n".join(config.get("admins", [])),
-        "\n".join(config.get("labelers", [])),
-        config.get("tarefa", "Detecção de Posição"),
-        config.get("videos_per_labeler", 10),
-        config.get("overlap_percent", 0),
-        "", pd.DataFrame(), gr.update(), gr.update(), gr.update(), "", gr.update()
+        "", "", gr.update(choices=[], value=None), pd.DataFrame(), gr.update(), gr.update(), gr.update(), "", gr.update(), ""
     )
 
     if not username:
-        return (gr.update(visible=True), gr.update(visible=False), gr.update(visible=False), "⚠️ Informe seu usuário.", "", [], 0, 0.0, 0.0, "", gr.update(visible=False), "", "", *blank_admin)
+        return (gr.update(visible=True), gr.update(visible=False), gr.update(visible=False), "⚠️ Informe seu usuário.", "", [], 0, 0.0, 0.0, "", gr.update(visible=False), "", "", *blank_admin, "")
+
+    if username in config.get("admins", []) or username in config.get("labelers", []):
+        if not claim_active_user(username):
+            return (gr.update(visible=True), gr.update(visible=False), gr.update(visible=False), "⚠️ Este usuário já está logado em outra sessão.", "", [], 0, 0.0, 0.0, "", gr.update(visible=False), "", "", *blank_admin, "")
 
     if username in config.get("admins", []):
         registrar_log(username, "LOGIN_ADMIN", 0)
         assignments = load_assignments(config, videos)
         results = read_results()
-        counts = assignments.groupby("labeler").size().to_dict() if not assignments.empty else {}
-        count_text = ", ".join(f"{labeler}: {count}" for labeler, count in counts.items()) or "nenhuma"
-        admin_msg = f"📊 {len(videos)} vídeos carregados; {len(results)} anotações coletadas; {len(assignments)} atribuições ativas. Carga: {count_text}."
+        errors = read_error_assignments()
+        versions = assignment_versions(assignments, results, errors)
+        current_version = versions[0] if versions else None
+        admin_msg = f"{len(videos)} vídeos | {len(results)} anotações | {len(assignments)} atribuições na rodada mais recente."
+        config_view = f"**Configuração vigente (somente leitura)**  \nAdministradores: `{', '.join(config.get('admins', []))}`  \nRotuladores: `{', '.join(config.get('labelers', []))}`  \nTarefa: `{config.get('tarefa', 'Detecção de Posição')}`  \nOverlap: `{config.get('overlap_percent', 0)}%`"
         file_res = gr.update(value=str(RESULTS_FILE) if RESULTS_FILE.exists() else None)
         file_log = gr.update(value=str(LOG_FILE) if LOG_FILE.exists() else None)
         file_err = gr.update(value=str(ERRORS_FILE) if ERRORS_FILE.exists() else None)
-        agreement_msg = agreement_summary(results)
+        agreement_msg = agreement_summary(results, current_version)
         file_agreement = gr.update(value=str(AGREEMENT_FILE))
+        assignment_view = assignment_table_for_version(assignments, results, errors, current_version)
 
-        return (gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), "", "", [], 0, 0.0, 0.0, "", gr.update(visible=False), "", "", "\n".join(config.get("admins", [])), "\n".join(config.get("labelers", [])), config.get("tarefa", "Detecção de Posição"), config.get("videos_per_labeler", 10), config.get("overlap_percent", 0), admin_msg, assignments, file_res, file_log, file_err, agreement_msg, file_agreement)
+        return (gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), "", "", [], 0, 0.0, 0.0, "", gr.update(visible=False), "", "", config_view, admin_msg, gr.update(choices=versions, value=current_version), assignment_view, file_res, file_log, file_err, agreement_msg, file_agreement, username)
 
     if username in config.get("labelers", []):
         registrar_log(username, "LOGIN_LABELER", 0)
@@ -508,30 +730,26 @@ def authenticate(username):
         position = completed_position(username, queue, read_results(), read_error_assignments())
         if not queue:
             new_position, video_html, controls_visible, pergunta, progress = video_outputs([], 0, username)
-            return (gr.update(visible=False), gr.update(visible=False), gr.update(visible=True), "", f"**Rotulador:** {username}", [], new_position, agora, agora, video_html, controls_visible, pergunta, progress, *blank_admin)
+            return (gr.update(visible=False), gr.update(visible=False), gr.update(visible=True), "", f"**Rotulador:** {username}", [], new_position, agora, agora, video_html, controls_visible, pergunta, progress, *blank_admin, username)
 
         new_position, video_html, controls_visible, pergunta, progress = video_outputs(queue, position, username)
-        return (gr.update(visible=False), gr.update(visible=False), gr.update(visible=True), "", f"**Rotulador:** {username}", queue, new_position, agora, agora, video_html, controls_visible, pergunta, progress, *blank_admin)
+        return (gr.update(visible=False), gr.update(visible=False), gr.update(visible=True), "", f"**Rotulador:** {username}", queue, new_position, agora, agora, video_html, controls_visible, pergunta, progress, *blank_admin, username)
 
-    return (gr.update(visible=True), gr.update(visible=False), gr.update(visible=False), "⚠️ Usuário não autorizado.", "", [], 0, 0.0, 0.0, "", gr.update(visible=False), "", "", *blank_admin)
+    return (gr.update(visible=True), gr.update(visible=False), gr.update(visible=False), "⚠️ Usuário não autorizado.", "", [], 0, 0.0, 0.0, "", gr.update(visible=False), "", "", *blank_admin, "")
 
-def reset_to_login(message="Sessão encerrada. Seu progresso foi salvo e será retomado no próximo login."):
+def reset_to_login(session_username="", message="Sessão encerrada. Seu progresso foi salvo e será retomado no próximo login."):
+    release_active_user(str(session_username).strip())
     config = load_config()
     blank_admin = (
-        "\n".join(config.get("admins", [])),
-        "\n".join(config.get("labelers", [])),
-        config.get("tarefa", "Detecção de Posição"),
-        config.get("videos_per_labeler", 10),
-        config.get("overlap_percent", 0),
-        "", pd.DataFrame(), gr.update(), gr.update(), gr.update(), "", gr.update()
+        "", "", gr.update(choices=[], value=None), pd.DataFrame(), gr.update(), gr.update(), gr.update(), "", gr.update(), ""
     )
-    return (gr.update(visible=True), gr.update(visible=False), gr.update(visible=False), message, "", [], 0, 0.0, 0.0, "", gr.update(visible=False), "", "", *blank_admin)
+    return (gr.update(visible=True), gr.update(visible=False), gr.update(visible=False), message, "", [], 0, 0.0, 0.0, "", gr.update(visible=False), "", "", *blank_admin, "")
 
 def save_and_exit(username):
     username_clean = str(username).replace("**Rotulador:** ", "").strip()
     if username_clean:
         registrar_log(username_clean, "SALVOU_E_SAIU", 0)
-    return reset_to_login()
+    return reset_to_login(username_clean)
 
 def save_admin_settings(admin_users, labeler_users, tarefa, videos_per_labeler, overlap_percent):
     videos = load_videos()
@@ -621,6 +839,36 @@ def save_annotation_error(username, queue, position, login_time, start_time):
     return process_annotation(username, queue, position, "ERRO_MANUAL_TIMEOUT", login_time, start_time)
 
 
+def release_port(port):
+    """Encerra o processo que ocupa a porta antes de iniciar o Gradio."""
+    port = int(port)
+    port_spec = f"{port}/tcp"
+    result = subprocess.run(
+        ["fuser", "-k", "-TERM", port_spec],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode != 0:
+        return
+
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                pass
+        except OSError:
+            return
+        time.sleep(0.1)
+
+    subprocess.run(
+        ["fuser", "-k", "-KILL", port_spec],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
 # ==============================================================================
 # INTERFACE E ESTILOS HORIZONTAIS ABSOLUTAMENTE BRANCOS
 # ==============================================================================
@@ -642,17 +890,39 @@ APP_CSS = """
 
     .gradio-container, .gradio-container .main, .gradio-container .contain { max-width: none !important; width: 100% !important; }
     .agreement-dashboard { width: 100%; margin: 10px 0 24px; color: #232323; }
+    .assignment-progress { margin: 0 0 22px; padding: 20px; border: 1px solid #dedede; border-top: 4px solid #9c0014; background: #ffffff; }
+    .section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
+    .section-heading h3 { margin: 2px 0 0; color: #232323; font-size: 21px; }
+    .section-eyebrow { color: #9c0014; font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+    .version-label { padding: 5px 8px; background: #f7f7f7; color: #666; font-family: monospace; font-size: 12px; }
+    .progress-table { width: 100%; border-collapse: collapse; }
+    .progress-table th, .progress-table td { padding: 11px 12px; border-bottom: 1px solid #ededed; text-align: left; background: #ffffff !important; color: #232323 !important; }
+    .progress-table th { background: #f7f7f7 !important; color: #666 !important; font-size: 13px; text-transform: uppercase; }
     .agreement-kpis { display: grid; grid-template-columns: repeat(3, minmax(160px, 1fr)); gap: 14px; margin: 12px 0 18px; }
     .kpi { border: 1px solid #e1e1e1; border-left: 4px solid #9c0014; padding: 14px 16px; background: #fffafa; }
     .kpi span { display: block; color: #666; font-size: 15px; text-transform: uppercase; }
     .kpi strong { display: block; color: #9c0014; font-size: 28px; margin-top: 4px; }
     .dashboard-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr); gap: 20px; }
+    .analytics-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr); gap: 20px; margin-top: 20px; }
+    .bar-row { display: grid; grid-template-columns: 92px minmax(0, 1fr) 28px; align-items: center; gap: 8px; margin: 10px 0; font-size: 13px; }
+    .bar-track { height: 12px; background: #f0e5e7; overflow: hidden; }
+    .bar-fill { height: 100%; background: #9c0014; }
+    .chart-legend { display: flex; flex-wrap: wrap; gap: 12px 18px; margin: 4px 0 16px; font-size: 13px; }
+    .chart-legend-item { display: inline-flex; align-items: center; gap: 6px; }
+    .chart-legend-item i { width: 10px; height: 10px; display: inline-block; }
+    .daily-annotation-day { padding: 10px 0 12px; border-top: 1px solid #ededed; }
+    .daily-day-label { display: flex; justify-content: space-between; margin-bottom: 7px; color: #333; font-weight: 700; font-size: 13px; }
+    .daily-day-label span { color: #888; font-weight: 400; }
+    .daily-bar-row { display: grid; grid-template-columns: 86px minmax(0, 1fr) 24px; align-items: center; gap: 8px; margin: 5px 0; font-size: 12px; }
+    .daily-bar-track { height: 10px; background: #f0f0f0; overflow: hidden; }
+    .daily-bar-fill { height: 100%; min-width: 2px; }
     .dashboard-card { border: 1px solid #e1e1e1; padding: 16px; background: #ffffff; min-width: 0; }
     .dashboard-card h3 { margin: 0 0 12px; color: #333; font-size: 19px; }
     .dashboard-card table { width: 100%; border-collapse: collapse; background: #ffffff !important; }
     .dashboard-card th, .dashboard-card td { padding: 11px 12px; border-bottom: 1px solid #ededed; text-align: left; background: #ffffff !important; color: #232323 !important; font-size: 16px; }
     .dashboard-card th { color: #666 !important; font-weight: 700; }
     .muted { color: #888 !important; }
+    .metric-note { margin: 6px 0 12px; color: #666; font-size: 13px; line-height: 1.45; }
     .duration-alert { margin: 14px 0 20px; padding: 16px; border: 1px solid #e0a400; border-left: 5px solid #c48700; background: #fff9e6; color: #4a3a00; }
     .duration-alert h3 { margin: 0 0 6px; color: #8a6200; font-size: 20px; }
     .duration-alert p { margin: 0 0 12px; font-size: 16px; }
@@ -676,6 +946,14 @@ APP_CSS = """
     .video-card > div:first-child { margin-top: 0; }
     .video-card iframe { display: block; width: min(100%, 600px) !important; max-width: 600px !important; height: 720px !important; overflow: hidden !important; }
     .video-meta { padding: 14px 16px; margin-bottom: 14px; border-left: 4px solid #9c0014; background: #fffafa; font-size: 16px; }
+    .target-transition { animation: target-highlight 12s ease-in-out; will-change: background, border-color, box-shadow, transform; }
+    @keyframes target-highlight {
+        0%, 100% { background: #fffafa; border-left-color: #9c0014; box-shadow: none; transform: translateY(0); }
+        8% { background: #ffd6dc; border-left-color: #d34758; box-shadow: 0 0 0 3px rgba(211, 71, 88, 0.28), 0 8px 20px rgba(156, 0, 20, 0.16); transform: translateY(-3px); }
+        28% { background: #fff0f2; border-left-color: #b51f35; box-shadow: 0 0 0 2px rgba(211, 71, 88, 0.22), 0 5px 14px rgba(156, 0, 20, 0.12); transform: translateY(0); }
+        55% { background: #ffe1e5; border-left-color: #c12d42; box-shadow: 0 0 0 3px rgba(211, 71, 88, 0.24), 0 6px 16px rgba(156, 0, 20, 0.14); }
+        78% { background: #fff1f3; border-left-color: #ae1c32; box-shadow: 0 0 0 2px rgba(211, 71, 88, 0.18), 0 4px 12px rgba(156, 0, 20, 0.1); }
+    }
     .video-content-grid { display: grid; grid-template-columns: minmax(360px, 0.8fr) minmax(0, 1.2fr); gap: 28px; align-items: start; }
     .video-player-column, .video-context-column { min-width: 0; }
     .video-player-column { display: flex; justify-content: center; align-items: flex-start; height: 720px; overflow: hidden; }
@@ -692,7 +970,7 @@ APP_CSS = """
     .brand-header { text-align: left !important; padding-left: 8px; }
     .labeler-actions { position: absolute !important; top: 24px; right: 36px; width: 440px !important; z-index: 10; }
     .labeler-actions button { margin-top: 0 !important; }
-    .admin-actions { position: absolute !important; top: 24px; right: 36px; width: 220px !important; z-index: 10; }
+    .admin-actions { position: absolute !important; top: 24px; right: 36px; width: 220px !important; margin: 0 !important; z-index: 10; }
     .admin-actions button { margin-top: 0 !important; }
     .annotation-controls { gap: 0 !important; row-gap: 0 !important; }
     .annotation-controls > .form, .annotation-controls > .block { margin-top: 0 !important; }
@@ -703,12 +981,12 @@ APP_CSS = """
 
     @media (max-width: 850px) {
         .shell { width: calc(100vw - 24px) !important; padding: 22px 16px !important; margin: 12px auto !important; }
-        .agreement-kpis, .dashboard-grid { grid-template-columns: 1fr; }
+        .agreement-kpis, .dashboard-grid, .analytics-grid { grid-template-columns: 1fr; }
         .labeler-layout { flex-direction: column !important; }
         .video-content-grid { grid-template-columns: 1fr; }
         .video-card iframe { width: 100% !important; max-width: 650px !important; }
         .labeler-actions { position: static !important; width: 100% !important; margin-bottom: 16px; }
-        .admin-actions { position: static !important; width: 100% !important; margin-bottom: 16px; }
+        .admin-actions { position: static !important; width: 100% !important; margin-bottom: 16px !important; }
     }
 
     .brand-header { border-bottom: 1px solid #eaeaea; padding-bottom: 25px; margin-bottom: 30px; text-align: left; }
@@ -719,8 +997,16 @@ APP_CSS = """
         background: #9c0014 !important; border: none !important; color: #ffffff !important;
         font-weight: 600 !important; font-size: 17px !important; padding: 13px 21px !important; width: 100% !important;
     }
-    .admin-panel, .admin-panel label, .admin-panel input, .admin-panel textarea, .admin-panel button { font-size: 18px !important; }
-    .admin-panel h2, .admin-panel h3 { font-size: 24px !important; }
+    .admin-panel { gap: 10px !important; }
+    .admin-panel, .admin-panel label, .admin-panel input, .admin-panel textarea, .admin-panel button { font-size: 15px !important; }
+    .admin-panel h2, .admin-panel h3 { font-size: 20px !important; }
+    .admin-header { align-items: center !important; justify-content: space-between !important; margin: 0 0 8px !important; min-height: 36px !important; }
+    .admin-header h2 { margin: 0 !important; }
+    .admin-configuration { min-height: 0 !important; padding: 9px 14px; border: 1px solid #e1e1e1; background: #fafafa; line-height: 1.45; }
+    .admin-configuration p { margin: 2px 0 !important; }
+    .admin-status { margin: 8px 0; padding: 9px 12px; border-left: 4px solid #9c0014; background: #fff5f6; }
+    .admin-downloads { margin: 10px 0 16px; padding: 8px; border-top: 1px solid #e5e5e5; border-bottom: 1px solid #e5e5e5; }
+    .admin-audit { margin: 16px 0 6px !important; }
     button.ufmg-btn:hover { background: #7a0010 !important; }
 
     button.error-btn {
@@ -807,36 +1093,29 @@ with gr.Blocks() as demo:
 
         # --- TELA DE ADMINISTRAÇÃO (Horizontal) ---
         with gr.Column(visible=False, elem_classes="admin-panel") as admin_panel:
-            gr.Markdown("## Administração de Pesquisa")
-            with gr.Row(elem_classes="admin-actions"):
-                admin_save_exit_button = gr.Button("Salvar e sair", elem_classes="error-btn")
+            with gr.Row(elem_classes="admin-header"):
+                gr.Markdown("## Administração de Pesquisa")
+                with gr.Row(elem_classes="admin-actions"):
+                    admin_save_exit_button = gr.Button("Salvar e sair", elem_classes="ufmg-btn")
 
-            with gr.Row(elem_classes="labeler-layout"):
-                admin_users_input = gr.Textbox(label="Administradores (um por linha)", lines=2)
-                labeler_users_input = gr.Textbox(label="Rotuladores (um por linha)", lines=2)
-                tarefa_input = gr.Textbox(label="Tarefa da Anotação", value=initial_config["tarefa"])
-
-            with gr.Row():
-                videos_per_labeler_input = gr.Number(label="Vídeos por rotulador (calculado)", value=initial_per_labeler, precision=0, minimum=0, interactive=False)
-                overlap_input = gr.Number(label="Redundância / Overlap (%)", value=initial_config["overlap_percent"], precision=1, minimum=0, maximum=100)
-                save_settings_button = gr.Button("Salvar Configurações e Gerar Atribuições", elem_classes="ufmg-btn")
-
-            admin_message = gr.Markdown()
+            admin_configuration = gr.Markdown(elem_classes="admin-configuration")
+            admin_message = gr.Markdown(elem_classes="admin-status")
             gr.Markdown("### Dados Coletados")
+            assignment_version_dropdown = gr.Dropdown(label="Rodada de atribuição exibida", choices=[], value=None, interactive=True)
             agreement_panel = gr.HTML()
-            with gr.Row():
+            with gr.Row(elem_classes="admin-downloads"):
                 results_download = gr.File(label="Resultados Anotação (CSV)")
                 log_download = gr.File(label="Metadados e Tempos (CSV)")
                 errors_download = gr.File(label="Vídeos com Erro (CSV)")
                 agreement_download = gr.File(label="Concordância (JSON)")
 
-            gr.Markdown("### Auditoria de Atribuições")
+            gr.Markdown("### Auditoria de Atribuições", elem_classes="admin-audit")
             assignment_table = gr.Dataframe(headers=["assignment_version", "assignment_id", "labeler", "video_id", "url", "target", "video_description", "voice_to_text", "video_duration"], interactive=False, elem_classes="assignment-table", max_height=2000, wrap=True)
 
         # --- TELA DE ROTULAÇÃO (LAYOUT HORIZONTAL) ---
         with gr.Column(visible=False, elem_classes="labeler-panel") as labeler_panel:
             with gr.Row(elem_classes="labeler-actions"):
-                save_exit_button = gr.Button("Salvar e sair", elem_classes="error-btn")
+                save_exit_button = gr.Button("Salvar e sair", elem_classes="ufmg-btn")
 
             with gr.Row(elem_classes="labeler-layout"):
                 with gr.Column(scale=5, min_width=1000, elem_classes="video-column"):
@@ -861,19 +1140,25 @@ with gr.Blocks() as demo:
             position_state = gr.State(0)
             login_time_state = gr.State(0.0)
             start_time_state = gr.State(0.0)
+            session_username_state = gr.State("")
 
     # --- EVENTOS ---
     outputs_login = [
         login_panel, admin_panel, labeler_panel, login_message,
         labeler_name, queue_state, position_state, login_time_state, start_time_state,
         video_html, annotation_controls, target_question, labeler_progress,
-        admin_users_input, labeler_users_input, tarefa_input, videos_per_labeler_input, overlap_input, admin_message, assignment_table, results_download, log_download, errors_download, agreement_panel, agreement_download
+        admin_configuration, admin_message, assignment_version_dropdown, assignment_table, results_download, log_download, errors_download, agreement_panel, agreement_download, session_username_state
     ]
     login_button.click(authenticate, inputs=username_input, outputs=outputs_login)
-    admin_save_exit_button.click(reset_to_login, outputs=outputs_login)
+    username_input.submit(authenticate, inputs=username_input, outputs=outputs_login)
+    admin_save_exit_button.click(reset_to_login, inputs=session_username_state, outputs=outputs_login)
     save_exit_button.click(save_and_exit, inputs=labeler_name, outputs=outputs_login)
 
-    save_settings_button.click(save_admin_settings, inputs=[admin_users_input, labeler_users_input, tarefa_input, videos_per_labeler_input, overlap_input], outputs=[admin_message, assignment_table, results_download, log_download, errors_download, videos_per_labeler_input])
+    assignment_version_dropdown.change(
+        lambda version: (agreement_summary(read_results(), version), assignment_table_for_version(load_assignments(load_config(), load_videos()), read_results(), read_error_assignments(), version)),
+        inputs=assignment_version_dropdown,
+        outputs=[agreement_panel, assignment_table],
+    )
 
     outputs_save = [position_state, start_time_state, video_html, annotation_controls, target_question, labeler_progress, labeler_message, stance_radio]
 
@@ -884,4 +1169,6 @@ with gr.Blocks() as demo:
     error_button.click(save_annotation_error, inputs=[labeler_name, queue_state, position_state, login_time_state, start_time_state], outputs=outputs_save)
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860, theme=tema_branco, css=APP_CSS)
+    server_port = int(os.getenv("GRADIO_SERVER_PORT", "7860"))
+    release_port(server_port)
+    demo.launch(server_name="0.0.0.0", server_port=server_port, theme=tema_branco, css=APP_CSS, share=True)

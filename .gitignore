@@ -8,13 +8,9 @@ venv/
 tests/.test-data/
 
 # Research input and runtime data
-videos.csv
-configuracao.json
-atribuicoes.csv
-resultados_anotacao.csv
-acessos_log.csv
-erros_videos.csv
-concordancia.json
+data/*.csv
+data/*.json
 
 # Local logs and generated exports
 *.log
+.gradio/

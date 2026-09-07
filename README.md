@@ -43,6 +43,8 @@ You can adapt:
 
 For `N` videos and overlap percentage `p`, the number of shared videos is `floor(N * p / 100)`. The remaining videos receive one assignment each. For example, 36 videos with 50% overlap and two annotators produce 18 shared videos, 18 single-annotator videos, and 54 total assignments, with 27 assignments per annotator.
 
+Assignments use a deterministic target-balanced policy. Videos are interleaved across target groups before selecting the overlap portion and distributing individual assignments, so the allocation does not simply follow the order in `videos.csv`. After allocation, each annotator's queue is sorted into contiguous target blocks. This balances target coverage while avoiding constant target switching during annotation. When the target changes in the interface, the target banner above the video receives a brief visual highlight.
+
 ## Assignment Management and Versioning
 
 Assignments are versioned from the ordered dataset and assignment configuration. A version changes when relevant input changes, including:
@@ -51,7 +53,7 @@ Assignments are versioned from the ordered dataset and assignment configuration.
 - the annotator list;
 - the overlap percentage.
 
-The current version is written to `atribuicoes.csv`. Each row contains an `assignment_version` and an `assignment_id` in the form:
+The current version is written to `data/atribuicoes.csv`. Each row contains an `assignment_version` and an `assignment_id` in the form:
 
 ```text
 <assignment_version>:<labeler>:<video_id>
@@ -63,15 +65,15 @@ This prevents annotations from an old dataset or old assignment configuration fr
 
 To start a new assignment round:
 
-1. Prepare the new `videos.csv` and review its order and IDs.
-2. Update annotators or overlap in `configuracao.json`, or use the administrator panel.
+1. Prepare the new `data/videos.csv` and review its order and IDs.
+2. Update annotators or overlap in `data/configuracao.json`, or use the administrator panel.
 3. Save the configuration or restart the application so the assignment version is regenerated.
-4. Review `atribuicoes.csv` and confirm its `assignment_version`, row count, and per-annotator distribution.
+4. Review `data/atribuicoes.csv` and confirm its `assignment_version`, row count, and per-annotator distribution.
 5. Keep previous results as historical data. Do not delete them unless the study protocol explicitly requires it.
 
 For a major study round, keep an external snapshot of the input dataset, configuration, assignments, results, and errors together with the assignment version.
 
-## Input File: `videos.csv`
+## Input File: `data/videos.csv`
 
 The required columns are:
 
@@ -96,7 +98,7 @@ id,url,target,video_description,voice_to_text,video_duration
 
 If an optional column is absent, the interface displays an appropriate unavailable message and the rest of the annotation flow continues.
 
-The application reads data from the project root by default. For deployments or tests that keep data elsewhere, set `TOKSTANCE_DATA_DIR` to a directory containing `videos.csv` and, optionally, `configuracao.json`:
+The application reads data from `data/` by default. For deployments or tests that keep data elsewhere, set `TOKSTANCE_DATA_DIR` to a directory containing `videos.csv` and, optionally, `configuracao.json`:
 
 ```bash
 TOKSTANCE_DATA_DIR=/secure/tokstance-data python3 src/app.py
@@ -110,8 +112,8 @@ These files may contain research data, URLs, user identifiers, annotations, conf
 
 ### Input and Configuration
 
-- `videos.csv`: sensitive input dataset. Template columns are `id,url,target`; optional feature columns are `video_description,voice_to_text,video_duration`. The application accepts additional columns for future adaptations, but only configured fields are displayed or persisted automatically.
-- `configuracao.json`: JSON configuration template containing `admins`, `labelers`, `videos_per_labeler`, `overlap_percent`, and `tarefa`. `videos_per_labeler` is calculated from the active assignment set and should not be treated as the primary assignment control.
+- `data/videos.csv`: sensitive input dataset. Template columns are `id,url,target`; optional feature columns are `video_description,voice_to_text,video_duration`. The application accepts additional columns for future adaptations, but only configured fields are displayed or persisted automatically.
+- `data/configuracao.json`: JSON configuration template containing `admins`, `labelers`, `videos_per_labeler`, `overlap_percent`, and `tarefa`. `videos_per_labeler` is calculated from the active assignment set and should not be treated as the primary assignment control.
 
 Example configuration:
 
@@ -127,22 +129,46 @@ Example configuration:
 
 ### Generated Assignment and Annotation Files
 
-- `atribuicoes.csv`: current assignment manifest. It contains `assignment_version`, `assignment_id`, `labeler`, `video_id`, `url`, `target`, optional feature fields, and `video_duration`. It is regenerated from the current dataset and configuration.
-- `resultados_anotacao.csv`: normal annotation records. Template columns are `timestamp,labeler,video_id,url,target,stance,tempo_analise_segundos,video_duration,assignment_id`. The application migrates legacy rows when possible.
-- `erros_videos.csv`: unavailable-video records. Template columns are `timestamp,video_id,url,labeler,assignment_id`. Legacy four-column rows are also read for compatibility.
-- `acessos_log.csv`: access and timing events with `timestamp,usuario,acao,tempo_desde_login_segundos`.
-- `concordancia.json`: generated report containing the agreement metric, comparable videos, discordant videos, and annotators with the highest disagreement.
+- `data/atribuicoes.csv`: current assignment manifest. It contains `assignment_version`, `assignment_id`, `labeler`, `video_id`, `url`, `target`, optional feature fields, and `video_duration`. It is regenerated from the current dataset and configuration.
+- `data/resultados_anotacao.csv`: normal annotation records. Template columns are `timestamp,labeler,video_id,url,target,stance,tempo_analise_segundos,video_duration,assignment_id`. The application migrates legacy rows when possible.
+- `data/erros_videos.csv`: unavailable-video records. Template columns are `timestamp,video_id,url,labeler,assignment_id`. Legacy four-column rows are also read for compatibility.
+- `data/acessos_log.csv`: access and timing events with `timestamp,usuario,acao,tempo_desde_login_segundos`.
+- `data/concordancia.json`: generated report containing the agreement metric, comparable videos, discordant videos, and annotators with the highest disagreement.
 
-## Local Development
+## Local Development and Useful Commands
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 python3 src/app.py
 ```
 
 Open the URL printed by Gradio. The default port is `7860`. If the port is already in use, set `GRADIO_SERVER_PORT` or change `server_port` in `src/app.py`.
+
+### Running with tmux
+
+Use `tmux` to keep the application running after disconnecting from the terminal:
+
+```bash
+# Create and enter a named session
+tmux new -s sessao-teste
+
+# Activate the environment and start the application inside the session
+source venv/bin/activate
+python3 src/app.py
+
+# Detach from the session while leaving the application running
+# Press Ctrl-b, then d
+
+# Reattach to the session later
+tmux attach -t sessao-teste
+
+# Stop the session and the application running inside it
+tmux kill-session -t sessao-teste
+```
+
+Run `tmux attach` before `tmux kill-session` when you need to inspect the running application. After a session is killed, it can no longer be attached.
 
 ## Tests
 
@@ -209,6 +235,30 @@ pytest -q
 
 `pytest.ini` adds the repository root to the Python path and restricts discovery to `tests/`.
 
+### Administrative Analytics
+
+The administrator dashboard is read-only. Configuration and assignment generation remain external to the interface; the dashboard lets administrators select an assignment round and inspect its data.
+
+The disagreement analysis uses the following explicit distance matrix:
+
+| Pair of labels | Distance / penalty |
+| --- | ---: |
+| Same label | 0 |
+| `Contra` vs. `Neutro` | 1 |
+| `Neutro` vs. `A Favor` | 1 |
+| `Contra` vs. `A Favor` | 4 |
+| `Vídeo não relacionado ao target` vs. any stance | 3 |
+
+The video score is the mean pairwise distance between annotations for that video. The annotator penalty is the sum of each annotator's mean distance to the other annotations on the same videos. Therefore, a polar disagreement between `Contra` and `A Favor` is penalized more heavily than a disagreement involving `Neutro`. The dashboard ranks annotators with the highest accumulated penalty and videos with the highest weighted divergence.
+
+The dashboard also includes visual summaries of:
+
+- assignment progress by annotator, including completed and pending videos;
+- weighted disagreement by annotator and video;
+- logins per day;
+- number of active days per annotator;
+- average session time based on the access log.
+
 The test suite creates a small synthetic dataset and configuration in `tests/.test-data/` through `tests/conftest.py`. These fixtures are intentionally fake and are ignored by Git; the real `videos.csv` and runtime data are never required by CI.
 
 ### Continuous integration
@@ -223,7 +273,7 @@ Regardless of the provider:
 
 1. Install the dependencies in `requirements.txt`.
 2. Expose the application on the provider's host and port.
-3. Provide `videos.csv` and `configuracao.json` through protected deployment storage.
+3. Provide `data/videos.csv` and `data/configuracao.json` through protected deployment storage, or set `TOKSTANCE_DATA_DIR` to the protected data directory.
 4. Use persistent storage for generated CSV and JSON files.
 5. Restrict administrator downloads and protect the annotation data.
 6. Configure HTTPS, authentication, backups, monitoring, and retention according to the research protocol.
@@ -247,13 +297,14 @@ For long-running or concurrent production use, replace local CSV/JSON persistenc
 │   ├── unit/                 # assignment math and versioning tests
 │   ├── integration/          # persistence and progress recovery tests
 │   └── system/               # application/interface contract tests
-├── videos.csv                # sensitive input, ignored by Git
-├── configuracao.json         # sensitive configuration, ignored by Git
-├── atribuicoes.csv           # generated assignment manifest, ignored by Git
-├── resultados_anotacao.csv   # generated annotations, ignored by Git
-├── erros_videos.csv          # generated unavailable-video records, ignored by Git
-├── acessos_log.csv           # generated access logs, ignored by Git
-└── concordancia.json         # generated agreement report, ignored by Git
+├── data/
+│   ├── videos.csv            # sensitive input, ignored by Git
+│   ├── configuracao.json     # sensitive configuration, ignored by Git
+│   ├── atribuicoes.csv       # generated assignment manifest, ignored by Git
+│   ├── resultados_anotacao.csv # generated annotations, ignored by Git
+│   ├── erros_videos.csv      # generated unavailable-video records, ignored by Git
+│   ├── acessos_log.csv       # generated access logs, ignored by Git
+│   └── concordancia.json     # generated agreement report, ignored by Git
 ```
 
 ## Security and Operations
